@@ -2,6 +2,7 @@ import argparse
 import os
 import re
 import csv
+import itertools
 import json
 from collections import defaultdict
 from typing import Dict, List, Tuple
@@ -10,6 +11,7 @@ import numpy as np
 from datasets import Audio, Dataset, DatasetDict, load_dataset, load_from_disk
 import evaluate
 from transformers import pipeline
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 
 TORGO_SPEAKERS = {
     "F01",
@@ -183,25 +185,26 @@ def zero_shot_inference(
     speakers = with_predictions["speaker"]
     preds = with_predictions["prediction"]
     refs = with_predictions["transcription"]
+    normalizer = BasicTextNormalizer()
 
     by_speaker = defaultdict(lambda: {"preds": [], "refs": []})
     for spk, pred, ref in zip(speakers, preds, refs):
-        by_speaker[str(spk)]["preds"].append(pred)
-        by_speaker[str(spk)]["refs"].append(ref)
+        by_speaker[str(spk)]["preds"].append(normalizer(pred))
+        by_speaker[str(spk)]["refs"].append(normalizer(ref))
 
     # compute WER for each speaker
     wer_results = {}
+
     for spk in sorted(by_speaker.keys()):
         spk_data = by_speaker[spk]
         wer_results[spk] = 100 * wer_metric.compute(
             predictions=spk_data["preds"],
             references=spk_data["refs"],
         )
-
-    # compute overall WER
+    # compute overall WER, flatten outer
     wer_results["overall"] = 100 * wer_metric.compute(
-        predictions=preds,
-        references=refs,
+        predictions=[normalizer(p) for p in preds],
+        references=[normalizer(r) for r in refs],
     )
 
     # compute CER for each speaker
@@ -215,8 +218,8 @@ def zero_shot_inference(
 
     # compute overall CER
     cer_results["overall"] = 100 * cer_metric.compute(
-        predictions=preds,
-        references=refs,
+        predictions=[normalizer(p) for p in preds],
+        references=[normalizer(r) for r in refs],
     )
 
     os.makedirs(output_dir, exist_ok=True)
@@ -276,6 +279,7 @@ def main() -> None:
 
     ratios = (args.train_ratio, args.val_ratio, args.test_ratio)
     dataset_with_speaker = "/home/fan/project/dataset/Huggingface_TORGO"
+    # dataset_with_speaker = "/media/justin/SSD Ubuntu Stora/datasets/TORGO"
     
     if os.path.exists(dataset_with_speaker):
         dataset = load_from_disk(dataset_with_speaker)
