@@ -4,13 +4,12 @@ import re
 import csv
 import itertools
 import json
+import evaluate
+import numpy as np
 from collections import defaultdict
 from typing import Dict, List, Tuple
-
-import numpy as np
 from datasets import Audio, Dataset, DatasetDict, load_dataset, load_from_disk
-import evaluate
-from transformers import pipeline
+from transformers import pipeline, WhisperProcessor
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 
 TORGO_SPEAKERS = {
@@ -90,7 +89,7 @@ def split_per_speaker(
     speaker_column: str,
     seed: int,
     ratios: Tuple[float, float, float],
-) -> DatasetDict:
+) -> Tuple[DatasetDict, Dict[str, List[int]]]:
     indices_by_speaker: Dict[str, List[int]] = defaultdict(list)
     # group by speaker
     for idx, spk in enumerate(dataset[speaker_column]):
@@ -112,10 +111,20 @@ def split_per_speaker(
         val_indices.extend(indices[n_train : n_train + n_val])
         test_indices.extend(indices[n_train + n_val : n_train + n_val + n_test])
 
-    return DatasetDict(
-        train=dataset.select(train_indices),
-        validation=dataset.select(val_indices),
-        test=dataset.select(test_indices),
+    indices_dict = {
+        "train": sorted(train_indices),
+        "validation": sorted(val_indices),
+        "test": sorted(test_indices),
+        "seed": seed,
+        "ratios": list(ratios),
+    }
+    return (
+        DatasetDict(
+            train=dataset.select(train_indices),
+            validation=dataset.select(val_indices),
+            test=dataset.select(test_indices),
+        ),
+        indices_dict,
     )
 
 
@@ -145,12 +154,37 @@ def zero_shot_inference(
     output_dir: str,
 ) -> None:
     device = 0 if __import__("torch").cuda.is_available() else -1
-    # load ASR model, huggingface pipeline from https://huggingface.co/openai/whisper-large-v3
-    asr = pipeline(
-        "automatic-speech-recognition",
-        model=model_name,
-        device=device,
-    )
+    print(device)
+
+    # Load checkpoint for inference
+    model_path = os.path.abspath(model_name)
+    processor_path = None
+    is_checkpoint_subdir = os.path.isdir(model_path) and "checkpoint-" in os.path.basename(model_path)
+    if is_checkpoint_subdir:
+        parent = os.path.dirname(model_path)
+        if os.path.isfile(os.path.join(parent, "preprocessor_config.json")):
+            processor_path = parent
+        else:
+            # Use base Whisper model for processor.
+            processor_path = "openai/whisper-small"
+   
+    if processor_path and is_checkpoint_subdir:
+        # Load processor and ASR pipeline from checkpoint
+        processor = WhisperProcessor.from_pretrained(processor_path)
+        asr = pipeline(
+            "automatic-speech-recognition",
+            model=model_path,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+            device=device,
+        )
+    else:
+        # Load ASR pipeline from model_name
+        asr = pipeline(
+            "automatic-speech-recognition",
+            model=model_name,
+            device=device,
+        )
 
     generate_kwargs = {"max_new_tokens": max_new_tokens}
     # English-only models (whisper-small.en) do not support task or language
@@ -176,7 +210,22 @@ def zero_shot_inference(
 
     # map _predict to the dataset
     with_predictions = dataset.map(_predict, batched=True, batch_size=batch_size)
-    json_ready = with_predictions.select_columns(["speaker", "transcription", "prediction"])
+    # json_ready = with_predictions.select_columns(["speaker", "transcription", "prediction"])
+    # json_ready.to_json(prediction_path)
+    # print(f"Saved test predictions to: {prediction_path}")
+
+    normalizer = BasicTextNormalizer()
+    def add_normalized(example):
+        return {
+            "trans_normalized": normalizer(example["transcription"]),
+            "pred_normalized": normalizer(example["prediction"]),
+        }
+
+    with_predictions = with_predictions.map(add_normalized)
+    json_ready = with_predictions.select_columns([
+        "speaker", "transcription", "prediction",
+        "pred_normalized", "trans_normalized",
+    ])
     json_ready.to_json(prediction_path)
     print(f"Saved test predictions to: {prediction_path}")
 
@@ -267,14 +316,17 @@ def main() -> None:
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--test_ratio", type=float, default=0.1)
     # inference settings
-    parser.add_argument("--model_name", default="openai/whisper-medium")
+    parser.add_argument("--model_name", default="openai/whisper-small", help="HuggingFace model or path to local checkpoint")
+    parser.add_argument("--checkpoint_dir", default=None, help="Load checkpoint for inference.")
     parser.add_argument("--language", default="en", help="Whisper language code")
     parser.add_argument("--task", default="transcribe")
     parser.add_argument("--max_new_tokens", type=int, default=225)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--run_inference", action="store_true")
-    parser.add_argument("--predictions_path", default="torgo_results/test_predictions.json")
-    parser.add_argument("--output_dir", default="torgo_results/test")
+    # output settings
+    parser.add_argument("--predictions_path", default="results/whisper-torgo/val/test_predictions.json")
+    parser.add_argument("--output_dir", default="results/whisper-torgo/val")
+    parser.add_argument("--split_indices", type=str, default="results/whisper-torgo/split_indices_test.json", help="Save train/val/test indices.")
     args = parser.parse_args()
 
     ratios = (args.train_ratio, args.val_ratio, args.test_ratio)
@@ -294,21 +346,30 @@ def main() -> None:
         dataset.save_to_disk(dataset_with_speaker)
     
     speaker_column = "speaker"
-    dataset_dict = split_per_speaker(
+    dataset_dict, split_indices = split_per_speaker(
         dataset=dataset,
         speaker_column=speaker_column,
         seed=args.seed,
         ratios=ratios,
     )
 
+    if args.split_indices:
+        os.makedirs(os.path.dirname(args.split_indices) or ".", exist_ok=True)
+        with open(args.split_indices, "w", encoding="utf-8") as f:
+            json.dump(split_indices, f, indent=2)
+        print(f"Saved split indices to {args.split_indices}")
+
     # dataset_dict.save_to_disk(args.output_dir)
     # save_speaker_counts_table(dataset_dict, args.speaker_counts_path)
     print(dataset_dict)
 
     if args.run_inference:
+        # Use checkpoint_dir if provided, else model_name
+        model_for_inference = args.checkpoint_dir if args.checkpoint_dir else args.model_name
         zero_shot_inference(
-            dataset=dataset_dict["test"],
-            model_name=args.model_name,
+            # dataset=dataset_dict["test"],
+            dataset=dataset_dict["validation"],
+            model_name=model_for_inference,
             batch_size=args.batch_size,
             max_new_tokens=args.max_new_tokens,
             language=args.language,
