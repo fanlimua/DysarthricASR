@@ -8,12 +8,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 from datasets import Audio, Dataset, DatasetDict, load_dataset, load_from_disk
 from transformers import (
+    GenerationConfig,
     WhisperForConditionalGeneration,
     WhisperProcessor,
     Seq2SeqTrainingArguments,
     Seq2SeqTrainer,
 )
-from main import split_per_speaker, append_speaker, fix_datasets_fs
+from main import append_speaker, fix_datasets_fs, dedup_per_speaker
+from util.data_split import split_dataset
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -96,6 +98,10 @@ def run_training(
         device_map="cuda" if torch.cuda.is_available() else "cpu",
     )
     model.config.forced_decoder_ids = None
+    # Force single language for evaluation (avoid "Multiple languages detected" in batch)
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.language = language
+        model.generation_config.task = task
 
     if use_lora:
         from peft import LoraConfig, get_peft_model
@@ -128,6 +134,7 @@ def run_training(
     gradient_accumulation_steps = kwargs.get("gradient_accumulation_steps", 1)
     warmup_ratio = kwargs.get("warmup_ratio", 0.1)
     fp16 = kwargs.get("fp16", True)
+    save_total_limit = kwargs.get("save_total_limit", 2)  
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
@@ -138,7 +145,9 @@ def run_training(
         warmup_ratio=warmup_ratio,
         num_train_epochs=num_train_epochs,
         evaluation_strategy="steps",
+        save_strategy="steps",
         save_steps=save_steps,
+        save_total_limit=save_total_limit,
         eval_steps=eval_steps,
         logging_steps=logging_steps,
         fp16=fp16,
@@ -184,6 +193,7 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=225)
     parser.add_argument("--num_proc", type=int, default=2)
     parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--save_total_limit", type=int, default=2, help="Max number of checkpoint dirs to keep.")
     parser.add_argument("--eval_steps", type=int, default=1000)
     parser.add_argument("--logging_steps", type=int, default=500)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -195,15 +205,20 @@ def main():
     parser.add_argument("--dataset_path", type=str, default=None, help="Path to TORGO dataset on disk")
     # split datasets settings
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--split_method", choices=("ratio", "loso"), default="loso", help="Dataset split method.")
     parser.add_argument("--train_ratio", type=float, default=0.8)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--test_ratio", type=float, default=0.1)
+    parser.add_argument("--loso_test_speaker", type=str, default="M01", help="Speaker ID for test set.")
+    parser.add_argument("--loso_val_speaker", type=str, default="M05", help="Speaker ID for validation set.")
+    parser.add_argument("--short_word_max_words", type=int, default=2, help="The length of utterances.")
+    parser.add_argument("--dedup", action="store_true", help="Enable per-speaker deduplication.")
     # output settings
-    parser.add_argument("--output_dir", type=str, default="results/whisper-torgo")
-    parser.add_argument("--split_indices", type=str, default="results/whisper-torgo/split_indices.json", help="Save train/val/test indices.")
+    parser.add_argument("--output_dir", type=str, default="results/train/loso_M01_M05")
+    parser.add_argument("--split_indices", type=str, default="results/data_split/split_indices.json", help="Save train/val/test indices.")
     args = parser.parse_args()
 
-    # load TORGO dataset and split into train, validation, and test sets
+    # load TORGO dataset 
     dataset_path = args.dataset_path or os.environ.get("DATASET_PATH", "/home/fan/project/dataset/Huggingface_TORGO")
     ratios = (args.train_ratio, args.val_ratio, args.test_ratio)
 
@@ -217,11 +232,29 @@ def main():
         os.makedirs(os.path.dirname(dataset_path) or ".", exist_ok=True)
         dataset.save_to_disk(dataset_path)
 
-    dataset_dict, split_indices = split_per_speaker(
+    # dataset Deduplication 
+    speaker_column = "speaker"
+    text_column = "transcription"
+    if args.dedup:
+        orig_size = len(dataset)
+        dedup_indices = dedup_per_speaker(
+            dataset=dataset,
+            speaker_column=speaker_column,
+            text_column=text_column,
+            short_word_max_words=args.short_word_max_words,
+        )
+        dataset = dataset.select(dedup_indices)
+        print("After deduplication: %d -> %d samples" % (orig_size, len(dataset)))
+
+    # dataset splitting
+    dataset_dict, split_indices = split_dataset(
         dataset=dataset,
-        speaker_column="speaker",
+        method=args.split_method,
+        speaker_column=speaker_column,
         seed=args.seed,
         ratios=ratios,
+        loso_test_speaker=args.loso_test_speaker,
+        loso_val_speaker=args.loso_val_speaker,
     )
     train_ds = dataset_dict["train"]
     # train_ds = dataset_dict["test"]
@@ -234,6 +267,7 @@ def main():
             json.dump(split_indices, f, indent=2)
         print(f"Saved split indices to {args.split_indices}")
     
+    # training
     run_training(
         train_ds=train_ds,
         val_ds=val_ds,
@@ -248,6 +282,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         num_proc=args.num_proc,
         save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
         eval_steps=args.eval_steps,
         logging_steps=args.logging_steps,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
