@@ -16,6 +16,7 @@ from transformers import (
 )
 from main import append_speaker, fix_datasets_fs, dedup_per_speaker
 from util.data_split import split_dataset
+from util.augment import AugmentedDataset, SetEpochCallback, list_rir_paths
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -115,11 +116,35 @@ def run_training(
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
-    def _map_fn(examples):
+    use_augmentation = kwargs.get("use_augmentation", False)
+    augment_seed = kwargs.get("seed", 42)
+    augment_snr_db_range = kwargs.get("augment_snr_db_range", (5.0, 20.0))
+    augment_rir_dir = kwargs.get("augment_rir_dir") or ""
+
+    def _map_fn_val(examples):
         return prepare_dataset(examples, processor.feature_extractor, processor.tokenizer, text_column)
 
-    train_ds = train_ds.map(_map_fn, batched=True, remove_columns=train_ds.column_names, num_proc=num_proc)
-    val_ds = val_ds.map(_map_fn, batched=True, remove_columns=val_ds.column_names, num_proc=num_proc)
+    # apply augmentation on train set
+    if use_augmentation:
+        rir_paths = list_rir_paths(augment_rir_dir) if augment_rir_dir and os.path.isdir(augment_rir_dir) else []
+        train_ds = AugmentedDataset(
+            train_ds,
+            processor.feature_extractor,
+            processor.tokenizer,
+            text_column,
+            augment_seed=augment_seed,
+            snr_db_range=augment_snr_db_range,
+            rir_paths=rir_paths,
+        )
+        print(f"Applied augmentation on train set.")
+    else:
+        train_ds = train_ds.map(
+            lambda examples: prepare_dataset(examples, processor.feature_extractor, processor.tokenizer, text_column),
+            batched=True,
+            remove_columns=train_ds.column_names,
+            num_proc=num_proc,
+        )
+    val_ds = val_ds.map(_map_fn_val, batched=True, remove_columns=val_ds.column_names, num_proc=num_proc)
 
     # Padding: ensures all audio features and token sequences in a batch have equal length
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(
@@ -162,6 +187,7 @@ def run_training(
         label_names=["labels"],
     )
 
+    callbacks = [SetEpochCallback()] if use_augmentation else []
     trainer = Seq2SeqTrainer(
         args=training_args,
         model=model,
@@ -170,6 +196,7 @@ def run_training(
         data_collator=data_collator,
         compute_metrics=lambda pred: compute_metrics(pred, processor.tokenizer),
         tokenizer=processor.feature_extractor,
+        callbacks=callbacks,
     )
 
     # Training
@@ -188,17 +215,17 @@ def main():
     # training settings
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
-    parser.add_argument("--num_train_epochs", type=int, default=30)
-    parser.add_argument("--use_lora", action="store_true")
     parser.add_argument("--max_new_tokens", type=int, default=225)
     parser.add_argument("--num_proc", type=int, default=2)
+    parser.add_argument("--num_train_epochs", type=int, default=30)
     parser.add_argument("--save_steps", type=int, default=1000)
-    parser.add_argument("--save_total_limit", type=int, default=2, help="Max number of checkpoint dirs to keep.")
     parser.add_argument("--eval_steps", type=int, default=1000)
     parser.add_argument("--logging_steps", type=int, default=500)
+    parser.add_argument("--save_total_limit", type=int, default=2, help="Max number of checkpoint dirs to keep.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--fp16", type=lambda x: x.lower() == "true", default=True)
+    parser.add_argument("--use_lora", action="store_true")
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
@@ -213,8 +240,12 @@ def main():
     parser.add_argument("--loso_val_speaker", type=str, default="M05", help="Speaker ID for validation set.")
     parser.add_argument("--short_word_max_words", type=int, default=2, help="The length of utterances.")
     parser.add_argument("--dedup", action="store_true", help="Enable per-speaker deduplication.")
+    parser.add_argument("--use_augmentation", action="store_true", help="Apply audio augmentation on train.")
+    parser.add_argument("--augment_snr_db_min", type=float, default=5.0, help="Min SNR (dB) for noise augmentation.")
+    parser.add_argument("--augment_snr_db_max", type=float, default=20.0, help="Max SNR (dB) for noise augmentation.")
+    parser.add_argument("--augment_rir_dir", type=str, default="data/RIR/RIRS_NOISES/real_rirs_isotropic_noises", help="Directory containing real RIR files.")
     # output settings
-    parser.add_argument("--output_dir", type=str, default="results/train/loso_M01_M05")
+    parser.add_argument("--output_dir", type=str, default="results/train/augment_torgo_3")
     parser.add_argument("--split_indices", type=str, default="results/data_split/split_indices.json", help="Save train/val/test indices.")
     args = parser.parse_args()
 
@@ -256,8 +287,8 @@ def main():
         loso_test_speaker=args.loso_test_speaker,
         loso_val_speaker=args.loso_val_speaker,
     )
-    train_ds = dataset_dict["train"]
-    # train_ds = dataset_dict["test"]
+    # train_ds = dataset_dict["train"]
+    train_ds = dataset_dict["test"]
     val_ds = dataset_dict["validation"]
 
     # save split indices
@@ -291,6 +322,10 @@ def main():
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        use_augmentation=args.use_augmentation,
+        augment_snr_db_range=(args.augment_snr_db_min, args.augment_snr_db_max),
+        augment_rir_dir=args.augment_rir_dir or None,
+        seed=args.seed,
     )
 
 
