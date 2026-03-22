@@ -13,6 +13,8 @@ from datasets import Audio, Dataset, DatasetDict, load_dataset, load_from_disk
 from transformers import pipeline, WhisperProcessor
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 from util.data_split import split_dataset
+from peft import PeftModel
+from transformers import WhisperForConditionalGeneration
 
 AUDIO_EXTENSIONS = ("*.wav", "*.flac", "*.mp3", "*.ogg", "*.m4a")
 
@@ -56,38 +58,6 @@ def fix_datasets_fs() -> None:
     ds_info.is_remote_filesystem = remote_filesystem_fixed
     
 
-def split_data(n: int, ratios: Tuple[float, float, float]) -> Tuple[int, int, int]:
-    train_ratio, val_ratio, test_ratio = ratios
-    if n <= 0:
-        return 0, 0, 0
-
-    n_train = int(n * train_ratio)
-    n_val = int(n * val_ratio)
-    n_test = n - n_train - n_val
-
-    # For tiny speakers, enforce a reasonable distribution.
-    if n >= 3:
-        if n_train == 0:
-            n_train = 1
-            n_test -= 1
-        if n_val == 0:
-            n_val = 1
-            n_test -= 1
-        if n_test == 0:
-            n_test = 1
-            if n_train > n_val:
-                n_train -= 1
-            else:
-                n_val -= 1
-    else:
-        # n is 1 or 2: fill train first, then val, then test.
-        n_train = min(1, n)
-        n_val = min(1, max(0, n - n_train))
-        n_test = max(0, n - n_train - n_val)
-
-    return n_train, n_val, n_test
-
-
 def dedup_per_speaker(
     dataset: Dataset,
     speaker_column: str,
@@ -124,49 +94,6 @@ def dedup_per_speaker(
                 sent_seen.add(norm)
             keep.append(idx)
     return keep
-
-def split_per_speaker(
-    dataset: Dataset,
-    speaker_column: str,
-    seed: int,
-    ratios: Tuple[float, float, float],
-) -> Tuple[DatasetDict, Dict[str, List[int]]]:
-    indices_by_speaker: Dict[str, List[int]] = defaultdict(list)
-    # group by speaker
-    for idx, spk in enumerate(dataset[speaker_column]):
-        indices_by_speaker[str(spk)].append(idx)
-
-    rng = np.random.default_rng(seed)
-
-    train_indices: List[int] = []
-    val_indices: List[int] = []
-    test_indices: List[int] = []
-
-    # split each speaker's data into train, val, test
-    for spk, indices in indices_by_speaker.items():
-        indices = list(indices)
-        rng.shuffle(indices)
-        n_train, n_val, n_test = split_data(len(indices), ratios)
-
-        train_indices.extend(indices[:n_train])
-        val_indices.extend(indices[n_train : n_train + n_val])
-        test_indices.extend(indices[n_train + n_val : n_train + n_val + n_test])
-
-    indices_dict = {
-        "train": sorted(train_indices),
-        "validation": sorted(val_indices),
-        "test": sorted(test_indices),
-        "seed": seed,
-        "ratios": list(ratios),
-    }
-    return (
-        DatasetDict(
-            train=dataset.select(train_indices),
-            validation=dataset.select(val_indices),
-            test=dataset.select(test_indices),
-        ),
-        indices_dict,
-    )
 
 
 def append_speaker(example: Dict[str, Dict[str, str]]) -> Dict[str, str]:
@@ -208,6 +135,7 @@ def inference_custom_audio(
     language: str,
     task: str,
     output_path: str,
+    load_lora: bool = False,
 ) -> None:
 
     device = 0 if __import__("torch").cuda.is_available() else -1
@@ -217,14 +145,31 @@ def inference_custom_audio(
     if is_checkpoint_subdir:
         processor_path = "openai/whisper-small"
         processor = WhisperProcessor.from_pretrained(processor_path)
-        asr = pipeline(
-            "automatic-speech-recognition",
-            model=model_path,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            device=device,
-        )
-        print(asr.model.name_or_path)
+        if load_lora:
+            # Load LoRA adapter from checkpoint
+            adapter_config_path = os.path.join(model_path, "adapter_config.json")
+            with open(adapter_config_path, "r") as f:
+                adapter_cfg = json.load(f)
+            base_name = adapter_cfg.get("base_model_name_or_path") 
+            base_model = WhisperForConditionalGeneration.from_pretrained(base_name)
+            model = PeftModel.from_pretrained(base_model, model_path)
+            asr = pipeline(
+                "automatic-speech-recognition",
+                model=model,
+                tokenizer=processor.tokenizer,
+                feature_extractor=processor.feature_extractor,
+                device=device,
+            )
+            print(f"Loading ASR (LoRA): base={base_name}, adapter={model_path}")
+        else:
+            asr = pipeline(
+                "automatic-speech-recognition",
+                model=model_path,
+                tokenizer=processor.tokenizer,
+                feature_extractor=processor.feature_extractor,
+                device=device,
+            )
+            print(asr.model.name_or_path)
     else:
         # Load ASR pipeline from model_name
         asr = pipeline("automatic-speech-recognition", model=model_name, device=device)
@@ -263,6 +208,7 @@ def inference(
     task: str,
     prediction_path: str,
     output_dir: str,
+    load_lora: bool = False,
 ) -> None:
     device = 0 if __import__("torch").cuda.is_available() else -1
     print(device)
@@ -275,13 +221,33 @@ def inference(
         # Load processor and ASR pipeline from checkpoint
         processor_path = "openai/whisper-small"
         processor = WhisperProcessor.from_pretrained(processor_path)
-        asr = pipeline(
-            "automatic-speech-recognition",
-            model=model_path,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            device=device,
-        )
+        if load_lora:
+            # Load LoRA adapter from checkpoint
+            adapter_config_path = os.path.join(model_path, "adapter_config.json")
+            with open(adapter_config_path, "r") as f:
+                adapter_cfg = json.load(f)
+            # lora wights only stored in adapter_config.json
+            base_name = adapter_cfg.get("base_model_name_or_path") 
+            base_model = WhisperForConditionalGeneration.from_pretrained(base_name)
+            model = PeftModel.from_pretrained(base_model, model_path)
+            asr = pipeline(
+                "automatic-speech-recognition",
+                model=model,
+                tokenizer=processor.tokenizer,
+                feature_extractor=processor.feature_extractor,
+                device=device,
+            )
+            print(f"Loading ASR model (LoRA): base={base_name}, adapter={model_path}")
+        else:
+            # Load full model from checkpoint
+            asr = pipeline(
+                "automatic-speech-recognition",
+                model=model_path,
+                tokenizer=processor.tokenizer,
+                feature_extractor=processor.feature_extractor,
+                device=device,
+            )
+            print(f"Loading ASR model from: {model_path}")
     else:
         # Load ASR pipeline from model_name
         asr = pipeline(
@@ -413,7 +379,7 @@ def save_speaker_counts_table(dataset_dict: DatasetDict, output_path: str) -> No
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inference on TOGOR dataset.")
     # split datasets settings
-    parser.add_argument("--data_source", choices=("torgo", "custom"), default="torgo", help="torgo: TORGO dataset, other: custom audio directory.")
+    parser.add_argument("--data_source", choices=("torgo", "custom"), default="torgo", help="torgo: TORGO dataset, custom: custom audio directory.")
     parser.add_argument("--audio_dir", type=str, default="/home/fan/project/whisper/data/audio_data/mp3", help="Directory of audio files.")
     parser.add_argument("--speaker_counts_path", default="torgo_results/speaker_counts.csv")
     parser.add_argument("--speaker_column", default=None)
@@ -428,15 +394,16 @@ def main() -> None:
     parser.add_argument("--dedup", action="store_true", help="Enable per-speaker deduplication.")
     # inference settings
     parser.add_argument("--model_name", default="openai/whisper-small", help="HuggingFace model or path to local checkpoint")
-    parser.add_argument("--checkpoint_dir", default="results/train/loso_M01_M05/checkpoint-17000", help="Load checkpoint for inference.")
+    parser.add_argument("--checkpoint_dir", default="results/train/augment_lora_r32/checkpoint-39000", help="Load checkpoint for inference.")
     parser.add_argument("--language", default="en", help="Whisper language code")
     parser.add_argument("--task", default="transcribe")
     parser.add_argument("--max_new_tokens", type=int, default=225)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--run_inference", action="store_true")
+    parser.add_argument("--load_lora", action="store_true", help="Load checkpoint as LoRA adapter (base model + adapter from checkpoint dir).")
     # output settings
-    parser.add_argument("--predictions_path", default="results/train/loso_M01_M05/kirk/test_predictions.json")
-    parser.add_argument("--output_dir", default="results/train/loso_M01_M05/kirk")
+    parser.add_argument("--predictions_path", default="results/train/augment_lora_r32/val/test_predictions.json")
+    parser.add_argument("--output_dir", default="results/train/augment_lora_r32/val")
     parser.add_argument("--split_indices", type=str, default=None, help="Save train/val/test indices.")
     args = parser.parse_args()
 
@@ -453,6 +420,7 @@ def main() -> None:
                 language=args.language,
                 task=args.task,
                 output_path=args.predictions_path,
+                load_lora=args.load_lora,
             )
         return
 
@@ -512,6 +480,7 @@ def main() -> None:
         model_for_inference = args.checkpoint_dir if args.checkpoint_dir else args.model_name
         inference(
             dataset=dataset_dict["test"],
+            # dataset=dataset_dict["validation"],
             model_name=model_for_inference,
             batch_size=args.batch_size,
             max_new_tokens=args.max_new_tokens,
@@ -519,6 +488,7 @@ def main() -> None:
             task=args.task,
             prediction_path=args.predictions_path,
             output_dir=args.output_dir,
+            load_lora=args.load_lora,
         )
 
 

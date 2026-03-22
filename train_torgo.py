@@ -245,7 +245,7 @@ def main():
     parser.add_argument("--augment_snr_db_max", type=float, default=20.0, help="Max SNR (dB) for noise augmentation.")
     parser.add_argument("--augment_rir_dir", type=str, default="data/RIR/RIRS_NOISES/real_rirs_isotropic_noises", help="Directory containing real RIR files.")
     # output settings
-    parser.add_argument("--output_dir", type=str, default="results/train/augment_torgo_3")
+    parser.add_argument("--output_dir", type=str, default="results/train/augment_lora_r32")
     parser.add_argument("--split_indices", type=str, default="results/data_split/split_indices.json", help="Save train/val/test indices.")
     args = parser.parse_args()
 
@@ -287,8 +287,8 @@ def main():
         loso_test_speaker=args.loso_test_speaker,
         loso_val_speaker=args.loso_val_speaker,
     )
-    # train_ds = dataset_dict["train"]
-    train_ds = dataset_dict["test"]
+    train_ds = dataset_dict["train"]
+    # train_ds = dataset_dict["test"]
     val_ds = dataset_dict["validation"]
 
     # save split indices
