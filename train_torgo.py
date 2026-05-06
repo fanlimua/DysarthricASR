@@ -14,11 +14,13 @@ from transformers import (
     Seq2SeqTrainingArguments,
     Seq2SeqTrainer,
 )
-from main import append_speaker, fix_datasets_fs, dedup_per_speaker
-from util.data_split import split_dataset
 from util.augment import AugmentedDataset, SetEpochCallback, list_rir_paths
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+torch.autograd.set_detect_anomaly(True)
+wer_metric = evaluate.load("wer")
+cer_metric = evaluate.load("cer")
 
 @dataclass
 # Pads audio features and label sequences so each batch has the same shape
@@ -27,12 +29,14 @@ class DataCollatorSpeechSeq2SeqWithPadding:
     decoder_start_token_id: int
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        input_features = [{"input_features": f["input_features"]} for f in features]
+        input_features = [{"input_features": self.processor.feature_extractor(f["input_features"],
+                                                sampling_rate=16000, return_tensors="pt")["input_features"].squeeze() } for f in features]
+        # print(input_features[0]["input_features"])
         batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
-
-        labels = [{"input_ids": f["labels"]} for f in features]
+        # print(features[0]["labels"])
+        labels = [{"input_ids": f["labels"]["input_ids"], "attention_mask": f["labels"]["attention_mask"]} for f in features]
         labels_batch = self.processor.tokenizer.pad(labels, return_tensors="pt")
-        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+        labels = labels_batch["input_ids"].masked_fill(labels_batch["attention_mask"].ne(1), -100)
 
         if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
             labels = labels[:, 1:]
@@ -41,36 +45,26 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         return batch
 
 
-def prepare_dataset(examples: Dict[str, Any], feature_extractor, tokenizer, text_column: str = "transcription") -> Dict[str, Any]:
-    # Convert audio to input_features and text to label ids
-    audios = examples["audio"]
-    texts = examples[text_column]
-    input_features = []
-    labels_list = []
-    for audio, text in zip(audios, texts):
-        input_features.append(
-            feature_extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
-        )
-        labels_list.append(tokenizer(text).input_ids)
-    return {"input_features": input_features, "labels": labels_list}
-
-
 def compute_metrics(pred, tokenizer):
     pred_ids = pred.predictions
     label_ids = pred.label_ids
     label_ids[label_ids == -100] = tokenizer.pad_token_id
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-    wer_metric = evaluate.load("wer")
     normalizer = BasicTextNormalizer()
     wer = 100 * wer_metric.compute(
         predictions=[normalizer(p) for p in pred_str], 
         references=[normalizer(l) for l in label_str],
     )
-    return {"wer": wer}
+    cer = 100 * cer_metric.compute(
+        predictions=[normalizer(p) for p in pred_str], 
+        references=[normalizer(l) for l in label_str],
+    )
+    return {"wer": wer, "cer": cer }
 
 
 def run_training(
+    processor: WhisperProcessor, 
     train_ds: Dataset,
     val_ds: Dataset,
     model_name: str = "openai/whisper-small",
@@ -92,7 +86,6 @@ def run_training(
     print(f"Loading model {model_name}...")
 
     # WhisperProcessor includes the feature extractor (audio -> log-Mel) and the tokenizer (text <-> ids).
-    processor = WhisperProcessor.from_pretrained(model_name, language=language, task=task)
     model = WhisperForConditionalGeneration.from_pretrained(
         model_name,
         torch_dtype=torch.float32,
@@ -121,31 +114,6 @@ def run_training(
     augment_snr_db_range = kwargs.get("augment_snr_db_range", (5.0, 20.0))
     augment_rir_dir = kwargs.get("augment_rir_dir") or ""
 
-    def _map_fn_val(examples):
-        return prepare_dataset(examples, processor.feature_extractor, processor.tokenizer, text_column)
-
-    # apply augmentation on train set
-    if use_augmentation:
-        rir_paths = list_rir_paths(augment_rir_dir) if augment_rir_dir and os.path.isdir(augment_rir_dir) else []
-        train_ds = AugmentedDataset(
-            train_ds,
-            processor.feature_extractor,
-            processor.tokenizer,
-            text_column,
-            augment_seed=augment_seed,
-            snr_db_range=augment_snr_db_range,
-            rir_paths=rir_paths,
-        )
-        print(f"Applied augmentation on train set.")
-    else:
-        train_ds = train_ds.map(
-            lambda examples: prepare_dataset(examples, processor.feature_extractor, processor.tokenizer, text_column),
-            batched=True,
-            remove_columns=train_ds.column_names,
-            num_proc=num_proc,
-        )
-    val_ds = val_ds.map(_map_fn_val, batched=True, remove_columns=val_ds.column_names, num_proc=num_proc)
-
     # Padding: ensures all audio features and token sequences in a batch have equal length
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(
         processor=processor,
@@ -167,9 +135,9 @@ def run_training(
         per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
-        warmup_ratio=warmup_ratio,
+        warmup_steps=warmup_ratio, # Float for ratio, int for steps 
         num_train_epochs=num_train_epochs,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         save_strategy="steps",
         save_steps=save_steps,
         save_total_limit=save_total_limit,
@@ -195,7 +163,8 @@ def run_training(
         eval_dataset=val_ds,
         data_collator=data_collator,
         compute_metrics=lambda pred: compute_metrics(pred, processor.tokenizer),
-        tokenizer=processor.feature_extractor,
+        processing_class=processor,
+        # tokenizer=processor.feature_extractor,
         callbacks=callbacks,
     )
 
@@ -245,63 +214,45 @@ def main():
     parser.add_argument("--augment_snr_db_max", type=float, default=20.0, help="Max SNR (dB) for noise augmentation.")
     parser.add_argument("--augment_rir_dir", type=str, default="data/RIR/RIRS_NOISES/real_rirs_isotropic_noises", help="Directory containing real RIR files.")
     # output settings
-    parser.add_argument("--output_dir", type=str, default="results/train/augment_lora_r32")
+    parser.add_argument("--output_dir", type=str, default="results/train/new_ds")
     parser.add_argument("--split_indices", type=str, default="results/data_split/split_indices.json", help="Save train/val/test indices.")
     args = parser.parse_args()
 
     # load TORGO dataset 
-    dataset_path = args.dataset_path or os.environ.get("DATASET_PATH", "/home/fan/project/dataset/Huggingface_TORGO")
-    ratios = (args.train_ratio, args.val_ratio, args.test_ratio)
+    # dataset_path = args.dataset_path or os.environ.get("DATASET_PATH", "/home/fan/project/dataset/Huggingface_TORGO")
+    # ratios = (args.train_ratio, args.val_ratio, args.test_ratio)
 
-    if os.path.exists(dataset_path):
-        dataset = load_from_disk(dataset_path)
-    else:
-        fix_datasets_fs()
-        hf_dict = load_dataset("abnerh/TORGO-database")
-        dataset = hf_dict["train"].cast_column("audio", Audio(sampling_rate=16000))
-        dataset = dataset.map(append_speaker)
-        os.makedirs(os.path.dirname(dataset_path) or ".", exist_ok=True)
-        dataset.save_to_disk(dataset_path)
+    dataset = load_dataset("extraordinarylab/torgo")["test"]
+    dataset = dataset.map(lambda x: {"length": x["audio"].get_all_samples().duration_seconds }, num_proc=4)
+    dataset = dataset.filter(lambda x: x["length"] <= 30, num_proc=4) # Manually confirmed the 2 samples above this are garbage
 
+    processor = WhisperProcessor.from_pretrained(args.model_name, language=args.language, task=args.task)
     # dataset Deduplication 
     speaker_column = "speaker"
-    text_column = "transcription"
+    text_column = "text"
     if args.dedup:
-        orig_size = len(dataset)
-        dedup_indices = dedup_per_speaker(
-            dataset=dataset,
-            speaker_column=speaker_column,
-            text_column=text_column,
-            short_word_max_words=args.short_word_max_words,
-        )
-        dataset = dataset.select(dedup_indices)
-        print("After deduplication: %d -> %d samples" % (orig_size, len(dataset)))
+        assert(False)
 
-    # dataset splitting
-    dataset_dict, split_indices = split_dataset(
-        dataset=dataset,
-        method=args.split_method,
-        speaker_column=speaker_column,
-        seed=args.seed,
-        ratios=ratios,
-        loso_test_speaker=args.loso_test_speaker,
-        loso_val_speaker=args.loso_val_speaker,
-    )
-    train_ds = dataset_dict["train"]
-    # train_ds = dataset_dict["test"]
-    val_ds = dataset_dict["validation"]
-
-    # save split indices
-    if args.split_indices:
-        os.makedirs(os.path.dirname(args.split_indices) or ".", exist_ok=True)
-        with open(args.split_indices, "w", encoding="utf-8") as f:
-            json.dump(split_indices, f, indent=2)
-        print(f"Saved split indices to {args.split_indices}")
+    val_speaker = args.loso_val_speaker
+    test_speaker = args.loso_test_speaker 
+    train_ds = dataset.filter(lambda x: x[speaker_column] != val_speaker and x[speaker_column] != test_speaker, num_proc=4)
+    val_ds = dataset.filter(lambda x: x[speaker_column] == val_speaker, num_proc=4)
+    tokenizer = processor.tokenizer 
+    def convert(ds, num_shards=32, iterable=True):
+        if iterable:
+            ds = ds.to_iterable_dataset(num_shards=num_shards)
+        return ds.map(
+            lambda x: {"input_features": x["audio"].get_all_samples().data.squeeze(), "labels": tokenizer(text=x[text_column]) }).remove_columns(
+                ["audio", "speaker", "speech_status", "microphone", "length"])
+    
+    train = convert(train_ds, iterable=False)
+    val = convert(val_ds, num_shards=16, iterable=False)
     
     # training
     run_training(
-        train_ds=train_ds,
-        val_ds=val_ds,
+        processor=processor,
+        train_ds=train,
+        val_ds=val,
         model_name=args.model_name,
         output_dir=args.output_dir,
         language=args.language,
