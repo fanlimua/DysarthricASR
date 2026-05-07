@@ -1,6 +1,7 @@
 import os
 import json
 import torch
+import numpy as np 
 import evaluate
 import argparse
 import warnings
@@ -16,6 +17,8 @@ from transformers import (
 )
 from util.augment import AugmentedDataset, SetEpochCallback, list_rir_paths
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
+from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift, RoomSimulator
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 torch.autograd.set_detect_anomaly(True)
@@ -214,7 +217,7 @@ def main():
     parser.add_argument("--augment_snr_db_max", type=float, default=20.0, help="Max SNR (dB) for noise augmentation.")
     parser.add_argument("--augment_rir_dir", type=str, default="data/RIR/RIRS_NOISES/real_rirs_isotropic_noises", help="Directory containing real RIR files.")
     # output settings
-    parser.add_argument("--output_dir", type=str, default="results/train/new_ds")
+    parser.add_argument("--output_dir", type=str, default="results/train/new_ds2")
     parser.add_argument("--split_indices", type=str, default="results/data_split/split_indices.json", help="Save train/val/test indices.")
     args = parser.parse_args()
 
@@ -246,6 +249,23 @@ def main():
                 ["audio", "speaker", "speech_status", "microphone", "length"])
     
     train = convert(train_ds, iterable=False)
+    transform_fn = Compose([
+        AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
+        # RoomSimulator(),
+        TimeStretch(min_rate=0.8, max_rate=1.25, p=0.5),
+        PitchShift(min_semitones=-4, max_semitones=4, p=0.5),
+        Shift(p=0.5, shift_unit="seconds"),
+    ])
+
+    def transform(batch):
+        try:
+            batch["input_features"] = [transform_fn(np.array(x, dtype=np.float32), sample_rate=16000) for x in batch["input_features"]]
+        except Exception:
+            pass
+        return batch
+
+    if args.use_augmentation:
+        train.set_transform(transform=transform)
     val = convert(val_ds, num_shards=16, iterable=False)
     
     # training
