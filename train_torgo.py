@@ -259,7 +259,7 @@ def main():
 
     def transform(batch):
         try:
-            batch["input_features"] = [transform_fn(np.array(x, dtype=np.float32), sample_rate=16000) for x in batch["input_features"]]
+            batch["input_features"] = [transform_fn(x.numpy(), sample_rate=16000) for x in batch["input_features"]]
         except Exception:
             pass
         return batch
