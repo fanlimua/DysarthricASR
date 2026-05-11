@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 from datasets import Audio, Dataset, DatasetDict, load_dataset, load_from_disk
 from transformers import (
+    AutoModelForSpeechSeq2Seq,
     GenerationConfig,
     WhisperForConditionalGeneration,
     WhisperProcessor,
@@ -88,13 +89,49 @@ def run_training(
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
     print(f"Loading model {model_name}...")
 
+    # Training settings
+    save_steps = kwargs.get("save_steps", 500)
+    eval_steps = kwargs.get("eval_steps", 500)
+    logging_steps = kwargs.get("logging_steps", 50)
+    gradient_accumulation_steps = kwargs.get("gradient_accumulation_steps", 1)
+    warmup_ratio = kwargs.get("warmup_ratio", 0.1)
+    fp16 = kwargs.get("fp16", True)
+    save_total_limit = kwargs.get("save_total_limit", 2) 
+
+    distill_whisper = False
+    if "distil" in model_name:
+        distill_whisper = True 
+
     # WhisperProcessor includes the feature extractor (audio -> log-Mel) and the tokenizer (text <-> ids).
-    model = WhisperForConditionalGeneration.from_pretrained(
-        model_name,
-        torch_dtype=torch.float32,
-        device_map="cuda" if torch.cuda.is_available() else "cpu",
-    )
-    model.config.forced_decoder_ids = None
+    # model = WhisperForConditionalGeneration.from_pretrained(
+    #     model_name,
+    #     torch_dtype=torch.float32,
+    #     device_map="cuda" if torch.cuda.is_available() else "cpu",
+    # )
+    # model.config.forced_decoder_ids = None
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    model_id = model_name
+    if distill_whisper:
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_id, low_cpu_mem_usage=False, use_safetensors=True
+        )
+        model.to(device).float()
+    else:
+        model = WhisperForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,
+            device_map="cuda" if torch.cuda.is_available() else "cpu",
+        )
+        model.config.forced_decoder_ids = None
+        if getattr(model, "generation_config", None) is not None:
+            model.generation_config.language = language
+            model.generation_config.task = task
+
+    print(model)
+
+    # processor = WhisperProcessor.from_pretrained("distil-whisper/distil-small.en")
+    # processor = AutoProcessor.from_pretrained(model_id)
     # Force single language for evaluation (avoid "Multiple languages detected" in batch)
     if getattr(model, "generation_config", None) is not None:
         model.generation_config.language = language
@@ -116,21 +153,21 @@ def run_training(
     augment_seed = kwargs.get("seed", 42)
     augment_snr_db_range = kwargs.get("augment_snr_db_range", (5.0, 20.0))
     augment_rir_dir = kwargs.get("augment_rir_dir") or ""
-
+    
     # Padding: ensures all audio features and token sequences in a batch have equal length
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(
         processor=processor,
         decoder_start_token_id=model.config.decoder_start_token_id,
-    )
+    ) 
 
-    # Training settings
-    save_steps = kwargs.get("save_steps", 500)
-    eval_steps = kwargs.get("eval_steps", 500)
-    logging_steps = kwargs.get("logging_steps", 50)
-    gradient_accumulation_steps = kwargs.get("gradient_accumulation_steps", 1)
-    warmup_ratio = kwargs.get("warmup_ratio", 0.1)
-    fp16 = kwargs.get("fp16", True)
-    save_total_limit = kwargs.get("save_total_limit", 2)  
+    if distill_whisper:
+        for n, p in model.named_parameters():
+            if "decoder" in n:
+                p.requires_grad_(True)
+            else:
+                p.requires_grad_(False)
+        # print(n)
+        # print(p.size())
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
@@ -156,6 +193,8 @@ def run_training(
         push_to_hub=False,
         remove_unused_columns=False,
         label_names=["labels"],
+        eval_on_start=False,
+        # resume_from_checkpoint="results/train/new_ds3/checkpoint-6000",
     )
 
     callbacks = [SetEpochCallback()] if use_augmentation else []
@@ -172,7 +211,7 @@ def run_training(
     )
 
     # Training
-    trainer.train()
+    trainer.train(resume_from_checkpoint=False)
     trainer.save_model(output_dir)
     processor.save_pretrained(output_dir)
     print(f"Model and processor saved to {output_dir}")
@@ -181,7 +220,7 @@ def run_training(
 def main():
     parser = argparse.ArgumentParser()
     # model settings
-    parser.add_argument("--model_name", type=str, default="openai/whisper-small")
+    parser.add_argument("--model_name", type=str, default="openai/whisper-small", choices=["openai/whisper-small", "distil-whisper/distil-large-v3"])
     parser.add_argument("--language", type=str, default="en")
     parser.add_argument("--task", type=str, default="transcribe")
     # training settings
@@ -217,7 +256,7 @@ def main():
     parser.add_argument("--augment_snr_db_max", type=float, default=20.0, help="Max SNR (dB) for noise augmentation.")
     parser.add_argument("--augment_rir_dir", type=str, default="data/RIR/RIRS_NOISES/real_rirs_isotropic_noises", help="Directory containing real RIR files.")
     # output settings
-    parser.add_argument("--output_dir", type=str, default="results/train/new_ds2")
+    parser.add_argument("--output_dir", type=str, default="results/train/new_ds4")
     parser.add_argument("--split_indices", type=str, default="results/data_split/split_indices.json", help="Save train/val/test indices.")
     args = parser.parse_args()
 
@@ -226,9 +265,13 @@ def main():
     # ratios = (args.train_ratio, args.val_ratio, args.test_ratio)
 
     dataset = load_dataset("extraordinarylab/torgo")["test"]
+    if len(dataset.cache_files) > 32: 
+        dataset.cleanup_cache_files() # Only cleans up parquet and not downloads 
+
     dataset = dataset.map(lambda x: {"length": x["audio"].get_all_samples().duration_seconds }, num_proc=4)
     dataset = dataset.filter(lambda x: x["length"] <= 30, num_proc=4) # Manually confirmed the 2 samples above this are garbage
 
+    # First experiment done with language unset in DistilWhisper 
     processor = WhisperProcessor.from_pretrained(args.model_name, language=args.language, task=args.task)
     # dataset Deduplication 
     speaker_column = "speaker"
@@ -275,7 +318,6 @@ def main():
         val_ds=val,
         model_name=args.model_name,
         output_dir=args.output_dir,
-        language=args.language,
         task=args.task,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
