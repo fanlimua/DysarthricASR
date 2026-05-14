@@ -20,7 +20,6 @@ from transformers import (
 from util.augment import AugmentedDataset, SetEpochCallback, list_rir_paths
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift, RoomSimulator, AddGaussianSNR, TimeMask
-from audiomentations import SpecCompose, SpecChannelShuffle, SpecFrequencyMask
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -68,6 +67,43 @@ def compute_metrics(pred, tokenizer):
     )
     return {"wer": wer, "cer": cer }
 
+def random_mask(x, max_mask_ratio=0.25):
+    """
+    Efficiently masks a sequential block of channels in a [B, C, T] tensor.
+    All batch samples share the same mask length, but the start index is random per sample.
+
+    Args:
+        x (torch.Tensor): Input tensor of shape [B, C, T].
+        max_mask_ratio (float): Maximum fraction of channels to mask.
+
+    Returns:
+        torch.Tensor: Tensor with sequential channels masked.
+    """
+    B, C, T = x.shape
+    masked_x = x.clone()
+
+    # Mask length (same for all batch samples)
+    mask_len = torch.randint(1, max(1, int(C * max_mask_ratio)) + 1, (1,)).item()
+
+    # Random start indices per batch
+    start_indices = torch.randint(0, C - mask_len + 1, (B,), device=x.device)
+
+    # Create a mask of shape [B, C] initialized to 1
+    mask = torch.ones(B, C, device=x.device)
+
+    # Generate a tensor of channel indices [C]
+    channel_indices = torch.arange(C, device=x.device).unsqueeze(0)  # [1, C]
+
+    # Broadcast start and length to [B, 1]
+    start_indices_broadcast = start_indices.unsqueeze(1)  # [B, 1]
+
+    # Mask sequential channels
+    mask *= ~((channel_indices >= start_indices_broadcast) & 
+              (channel_indices < start_indices_broadcast + mask_len))
+
+    # Expand mask to [B, C, T] and apply
+    masked_x = masked_x * mask.unsqueeze(-1)
+    return masked_x
 
 class SudoTrainer(Seq2SeqTrainer):
     def training_step(
@@ -77,6 +113,7 @@ class SudoTrainer(Seq2SeqTrainer):
         num_items_in_batch: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
         try:
+            inputs["input_features"] = random_mask(inputs["input_features"])
             val = super().training_step(model, inputs, num_items_in_batch)
             # print(val)
             # assert(False)
@@ -146,6 +183,7 @@ def run_training(
             model.generation_config.language = language
             model.generation_config.task = task
 
+    # model.config.apply_spec_augment = True
     print(model)
 
     # processor = WhisperProcessor.from_pretrained("distil-whisper/distil-small.en")
@@ -319,12 +357,6 @@ def main():
         TimeMask()
         # Shift(p=0.5, shift_unit="seconds"),
     ])
-    spec_transform_fn = SpecCompose(
-    [
-        SpecChannelShuffle(p=0.5),
-        SpecFrequencyMask(p=0.5, fill_mode="mean"),
-    ]
-)
 
     def transform(batch):
         try:
