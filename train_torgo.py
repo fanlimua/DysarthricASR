@@ -1,6 +1,7 @@
 import os
 import json
 import torch
+import torch.nn as nn
 import numpy as np 
 import evaluate
 import argparse
@@ -18,7 +19,8 @@ from transformers import (
 )
 from util.augment import AugmentedDataset, SetEpochCallback, list_rir_paths
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
-from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift, RoomSimulator
+from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift, RoomSimulator, AddGaussianSNR, TimeMask
+from audiomentations import SpecCompose, SpecChannelShuffle, SpecFrequencyMask
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -66,6 +68,22 @@ def compute_metrics(pred, tokenizer):
     )
     return {"wer": wer, "cer": cer }
 
+
+class SudoTrainer(Seq2SeqTrainer):
+    def training_step(
+        self,
+        model: nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        num_items_in_batch: torch.Tensor | int | None = None,
+    ) -> torch.Tensor:
+        try:
+            val = super().training_step(model, inputs, num_items_in_batch)
+            # print(val)
+            # assert(False)
+            return val
+        except RuntimeError:
+            device = next(iter(inputs.values())).device
+            return torch.tensor(0.0).to(device=device)
 
 def run_training(
     processor: WhisperProcessor, 
@@ -194,11 +212,11 @@ def run_training(
         remove_unused_columns=False,
         label_names=["labels"],
         eval_on_start=False,
-        # resume_from_checkpoint="results/train/new_ds3/checkpoint-6000",
+        # resume_from_checkpoint="results/train/new_ds4/checkpoint-27000",
     )
 
     callbacks = [SetEpochCallback()] if use_augmentation else []
-    trainer = Seq2SeqTrainer(
+    trainer = SudoTrainer(
         args=training_args,
         model=model,
         train_dataset=train_ds,
@@ -209,7 +227,6 @@ def run_training(
         # tokenizer=processor.feature_extractor,
         callbacks=callbacks,
     )
-
     # Training
     trainer.train(resume_from_checkpoint=False)
     trainer.save_model(output_dir)
@@ -292,13 +309,22 @@ def main():
                 ["audio", "speaker", "speech_status", "microphone", "length"])
     
     train = convert(train_ds, iterable=False)
+
     transform_fn = Compose([
-        AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
+        AddGaussianSNR(min_snr_db=args.augment_snr_db_min, max_snr_db=args.augment_snr_db_max, p=0.5),
+        # AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
         # RoomSimulator(),
         TimeStretch(min_rate=0.8, max_rate=1.25, p=0.5),
-        PitchShift(min_semitones=-4, max_semitones=4, p=0.5),
-        Shift(p=0.5, shift_unit="seconds"),
+        PitchShift(min_semitones=-2, max_semitones=2, p=0.5),
+        TimeMask()
+        # Shift(p=0.5, shift_unit="seconds"),
     ])
+    spec_transform_fn = SpecCompose(
+    [
+        SpecChannelShuffle(p=0.5),
+        SpecFrequencyMask(p=0.5, fill_mode="mean"),
+    ]
+)
 
     def transform(batch):
         try:
