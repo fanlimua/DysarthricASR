@@ -67,6 +67,48 @@ def compute_metrics(pred, tokenizer):
     )
     return {"wer": wer, "cer": cer }
 
+def local_channel_shuffle(x, window_size=16):
+    """
+    Randomly shuffle channels locally within fixed windows.
+
+    Args:
+        x (torch.Tensor):
+            Input tensor of shape [B, C, T]
+        window_size (int):
+            Number of neighboring channels to shuffle together.
+
+    Returns:
+        torch.Tensor:
+            Tensor with locally shuffled channels, shape [B, C, T]
+    """
+    B, C, T = x.shape
+    device = x.device
+
+    # Output tensor
+    out = x.clone()
+
+    # Process channel windows
+    for start in range(0, C, window_size):
+        end = min(start + window_size, C)
+        curr_window = end - start
+
+        # Independent random permutation per batch
+        perms = torch.stack([
+            torch.randperm(curr_window, device=device)
+            for _ in range(B)
+        ])  # [B, curr_window]
+
+        # Convert local indices -> global channel indices
+        perms = perms + start  # [B, curr_window]
+
+        # Batch indexing
+        batch_idx = torch.arange(B, device=device).unsqueeze(1)
+
+        # Apply shuffle
+        out[:, start:end, :] = x[batch_idx, perms, :]
+
+    return out
+
 def random_mask(x, max_mask_ratio=0.25):
     """
     Efficiently masks a sequential block of channels in a [B, C, T] tensor.
@@ -113,7 +155,7 @@ class SudoTrainer(Seq2SeqTrainer):
         num_items_in_batch: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
         try:
-            inputs["input_features"] = random_mask(inputs["input_features"])
+            inputs["input_features"] = local_channel_shuffle(inputs["input_features"])
             val = super().training_step(model, inputs, num_items_in_batch)
             # print(val)
             # assert(False)
