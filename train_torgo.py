@@ -17,9 +17,9 @@ from transformers import (
     Seq2SeqTrainingArguments,
     Seq2SeqTrainer,
 )
-from util.augment import AugmentedDataset, SetEpochCallback, list_rir_paths
+from util.augment import SetEpochCallback, build_subsets
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
-from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift, RoomSimulator, AddGaussianSNR, TimeMask
+from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift, RepeatPart, AddGaussianSNR, TimeMask
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -82,6 +82,7 @@ def local_channel_shuffle(x, window_size=16):
             Tensor with locally shuffled channels, shape [B, C, T]
     """
     B, C, T = x.shape
+    assert(C == 128) # DistilWhisper Large
     device = x.device
 
     # Output tensor
@@ -307,7 +308,56 @@ def run_training(
         # tokenizer=processor.feature_extractor,
         callbacks=callbacks,
     )
-    # Training
+    if False:
+        healthy, dys = build_subsets(train_ds, "FC01", "F01")
+        transform_fn = Compose([
+            AddGaussianSNR(min_snr_db=5.0, max_snr_db=20.0, p=0.5),
+            # AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
+            # RoomSimulator(),
+            TimeStretch(min_rate=1.0, max_rate=1.25, p=1.0),
+            PitchShift(min_semitones=-2, max_semitones=2, p=0.5),
+            # RepeatPart(max_repeats=1, max_part_duration=0.5),
+            TimeMask()
+            # Shift(p=0.5, shift_unit="seconds"),
+        ])
+        def transform(batch):
+            batch["input_features"] = [transform_fn(np.array(x, dtype=np.float32), sample_rate=16000) for x in batch["input_features"]]
+            return batch
+        healthy.set_transform(transform=transform)
+        # healthy = healthy.with_transform(transform=transform)
+        trainer = SudoTrainer(
+            args=training_args,
+            model=model,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            data_collator=data_collator,
+            compute_metrics=lambda pred: compute_metrics(pred, processor.tokenizer),
+            processing_class=processor,
+            callbacks=callbacks,
+        )
+        norm = BasicTextNormalizer()
+        out1 = trainer.predict(healthy)
+        preds1 = out1.predictions
+        text1 = processor.batch_decode(preds1, skip_special_tokens=True) 
+        # print(text)
+        print(out1.metrics)
+
+        out2 = trainer.predict(healthy) # TODO adjust 
+        preds2 = out2.predictions
+        text2 = processor.batch_decode(preds2, skip_special_tokens=True) 
+        cer_score = 100.0 * cer_metric.compute(predictions=[norm(t) for t in text1], 
+                        references=[norm(t) for t in text2]) # Dysarthric is reference
+        print(out2.metrics)
+        print(f"CER Score {cer_score}")
+        with open("text1.txt", "w") as f:
+            f.writelines([norm(t) + "\n" for t in text1])
+        with open("text2.txt", "w") as f:
+            f.writelines([norm(t) + "\n" for t in text2])
+        
+        
+        assert(False)
+
+    # Training 
     trainer.train(resume_from_checkpoint=False)
     trainer.save_model(output_dir)
     processor.save_pretrained(output_dir)
@@ -353,7 +403,7 @@ def main():
     parser.add_argument("--augment_snr_db_max", type=float, default=20.0, help="Max SNR (dB) for noise augmentation.")
     parser.add_argument("--augment_rir_dir", type=str, default="data/RIR/RIRS_NOISES/real_rirs_isotropic_noises", help="Directory containing real RIR files.")
     # output settings
-    parser.add_argument("--output_dir", type=str, default="results/train/new_ds4")
+    parser.add_argument("--output_dir", type=str, default="results/train/new_ds5")
     parser.add_argument("--split_indices", type=str, default="results/data_split/split_indices.json", help="Save train/val/test indices.")
     args = parser.parse_args()
 
@@ -381,12 +431,12 @@ def main():
     train_ds = dataset.filter(lambda x: x[speaker_column] != val_speaker and x[speaker_column] != test_speaker, num_proc=4)
     val_ds = dataset.filter(lambda x: x[speaker_column] == val_speaker, num_proc=4)
     tokenizer = processor.tokenizer 
-    def convert(ds, num_shards=32, iterable=True):
+    def convert(ds, num_shards=32, iterable=False):
         if iterable:
             ds = ds.to_iterable_dataset(num_shards=num_shards)
         return ds.map(
             lambda x: {"input_features": x["audio"].get_all_samples().data.squeeze(), "labels": tokenizer(text=x[text_column]) }).remove_columns(
-                ["audio", "speaker", "speech_status", "microphone", "length"])
+                ["audio", "speech_status", "microphone", "length"])
     
     train = convert(train_ds, iterable=False)
 
@@ -402,9 +452,9 @@ def main():
 
     def transform(batch):
         try:
-            batch["input_features"] = [transform_fn(x.numpy(), sample_rate=16000) for x in batch["input_features"]]
+            batch["input_features"] = [transform_fn(np.array(x, dtype=np.float32), sample_rate=16000) for x in batch["input_features"]]
         except Exception:
-            pass
+            assert(False)
         return batch
 
     if args.use_augmentation:

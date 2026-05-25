@@ -1,3 +1,4 @@
+from collections import defaultdict
 import os
 import glob
 from typing import Any, Dict, List, Optional
@@ -11,9 +12,38 @@ from audiomentations import (
     ApplyImpulseResponse,
     PitchShift,
 )
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 
 # speed factors
 DEFAULT_SPEED_FACTORS = (0.9, 1.0, 1.1)
+
+def build_subsets(train_ds, control, patient):
+    data = defaultdict(list)
+    norm = BasicTextNormalizer()
+    all_text = defaultdict(list)
+    # This is inefficient 
+    train_ds = train_ds.filter(lambda x: x["speaker"] == control or x["speaker"] == patient, num_proc=4)
+    for idx in range(len(train_ds)):
+        d = train_ds[idx]
+        speaker = d["speaker"]
+        text = norm(d["text"])
+        data[speaker].append(idx)
+        all_text[text].append(idx)
+
+    data_set = {k: set(v) for k, v in data.items()}
+    healthy = []
+    dys = []
+    # Pair like transcripts together 
+    for idx in data_set[control]:
+        d = train_ds[idx]
+        speaker = d["speaker"]
+        text = norm(d["text"])
+        valid = [x in data_set[patient] for x in all_text[text]]
+        if any(valid):
+            healthy.append(idx)
+            i = valid.index(True)
+            dys.append(all_text[text][i])
+    return train_ds.select(healthy), train_ds.select(dys)
 
 
 def list_rir_paths(root_dir: str, exts: Optional[List[str]] = None) -> List[str]:
