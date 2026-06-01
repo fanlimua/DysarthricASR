@@ -1,139 +1,78 @@
 from collections import defaultdict
 from typing import Dict, List, Tuple
 import numpy as np
-from datasets import Dataset, DatasetDict
+from datasets import Dataset, DatasetDict, load_dataset
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
+
+def get_torgo(val_speaker, test_speaker, tokenizer):
+    dataset = load_dataset("extraordinarylab/torgo")["test"]
+    if len(dataset.cache_files) > 32: 
+        dataset.cleanup_cache_files() # Only cleans up parquet and not downloads 
+
+    dataset = dataset.map(lambda x: {"length": x["audio"].get_all_samples().duration_seconds }, num_proc=4)
+    dataset = dataset.filter(lambda x: x["length"] <= 30, num_proc=4) # Manually confirmed the 2 samples above this are garbage
+    speaker_column = "speaker"
+    text_column = "text"
+    train_ds = dataset.filter(lambda x: x[speaker_column] != val_speaker and x[speaker_column] != test_speaker, num_proc=4)
+    val_ds = dataset.filter(lambda x: x[speaker_column] == val_speaker, num_proc=4)
+    def convert(ds, num_shards=32, iterable=False):
+        if iterable:
+            ds = ds.to_iterable_dataset(num_shards=num_shards)
+        return ds.map(
+            lambda x: {"input_features": x["audio"].get_all_samples().data.squeeze(), "labels": tokenizer(text=x[text_column]) }).remove_columns(
+                ["audio", "speech_status", "microphone", "length"])
+    
+    train = convert(train_ds, iterable=False)
+    val = convert(val_ds, num_shards=16, iterable=False)
+    return train, val
+
+def partition_torgo_on_phrase(tokenizer, val_count=10):
+    dataset = load_dataset("extraordinarylab/torgo")["test"]
+    if len(dataset.cache_files) > 32: 
+        dataset.cleanup_cache_files() # Only cleans up parquet and not downloads 
+    text_column = "text"
+    dataset = dataset.map(lambda x: {"length": x["audio"].get_all_samples().duration_seconds }, num_proc=4)
+    dataset = dataset.filter(lambda x: x["length"] <= 30, num_proc=4) # Manually confirmed the 2 samples above this are garbage
+    data = defaultdict(list)
+    norm = BasicTextNormalizer()
+    all_text = defaultdict(list)
+    for idx in range(len(dataset)):
+        d = dataset[idx]
+        speaker = d["speaker"]
+        text = norm(d["text"])
+        data[speaker].append(idx)
+        all_text[text].append(idx)
+    data_set = {k: i for (i, k) in enumerate(all_text)}
+
+    val_ds = dataset.filter(lambda x: data_set[norm(x["text"])] % val_count == 0, num_proc=4)
+    train_ds = dataset.filter(lambda x: data_set[norm(x["text"])] % val_count != 0, num_proc=4)
+
+    def convert(ds, num_shards=32, iterable=False):
+        if iterable:
+            ds = ds.to_iterable_dataset(num_shards=num_shards)
+        return ds.map(
+            lambda x: {"input_features": x["audio"].get_all_samples().data.squeeze(), "labels": tokenizer(text=x[text_column]) }).remove_columns(
+                ["audio", "speech_status", "microphone", "length"])
+    
+    train = convert(train_ds, iterable=False)
+    val = convert(val_ds, num_shards=16, iterable=False)
+    return train, val
+
+def get_libri_test(tokenizer):
+    dataset = load_dataset("SPRINGLab/LibriSpeech-Test")["train"]
+    text_column = "text"
+    if len(dataset.cache_files) > 16: 
+        dataset.cleanup_cache_files() # Only cleans up parquet and not downloads 
+
+    dataset = dataset.map(lambda x: {"length": x["audio"].get_all_samples().duration_seconds }, num_proc=4)
+    dataset = dataset.filter(lambda x: x["length"] <= 30, num_proc=4) # Manually confirmed the 2 samples above this are garbage
+
+    def convert(ds):
+        return ds.map(
+            lambda x: {"input_features": x["audio"].get_all_samples().data.squeeze(), "labels": tokenizer(text=x[text_column]) }).remove_columns(
+                ["audio", "id", "length"])
+    
+    test = convert(dataset)
+    return test
 
 
-def split_data(n: int, ratios: Tuple[float, float, float]) -> Tuple[int, int, int]:
-    train_ratio, val_ratio, test_ratio = ratios
-    if n <= 0:
-        return 0, 0, 0
-    n_train = int(n * train_ratio)
-    n_val = int(n * val_ratio)
-    n_test = n - n_train - n_val
-    if n >= 3:
-        if n_train == 0:
-            n_train = 1
-            n_test -= 1
-        if n_val == 0:
-            n_val = 1
-            n_test -= 1
-        if n_test == 0:
-            n_test = 1
-            if n_train > n_val:
-                n_train -= 1
-            else:
-                n_val -= 1
-    else:
-        n_train = min(1, n)
-        n_val = min(1, max(0, n - n_train))
-        n_test = max(0, n - n_train - n_val)
-        
-    return n_train, n_val, n_test
-
-def split_per_speaker_ratio(
-    dataset: Dataset,
-    speaker_column: str,
-    seed: int,
-    ratios: Tuple[float, float, float],
-) -> Tuple[DatasetDict, Dict]:
-    # group by speaker
-    indices_by_speaker: Dict[str, List[int]] = defaultdict(list)
-    for idx, spk in enumerate(dataset[speaker_column]):
-        indices_by_speaker[str(spk)].append(idx)
-
-    rng = np.random.default_rng(seed)
-    train_indices: List[int] = []
-    val_indices: List[int] = []
-    test_indices: List[int] = []
-
-    # split each speaker's data into train, val, test
-    for spk, indices in indices_by_speaker.items():
-        indices = list(indices)
-        rng.shuffle(indices)
-        n_train, n_val, n_test = split_data(len(indices), ratios)
-        train_indices.extend(indices[:n_train])
-        val_indices.extend(indices[n_train : n_train + n_val])
-        test_indices.extend(indices[n_train + n_val : n_train + n_val + n_test])
-
-    indices_dict = {
-        "train": sorted(train_indices),
-        "validation": sorted(val_indices),
-        "test": sorted(test_indices),
-        "split_method": "ratio",
-        "seed": seed,
-        "ratios": list(ratios),
-    }
-    return (
-        DatasetDict(
-            train=dataset.select(train_indices),
-            validation=dataset.select(val_indices),
-            test=dataset.select(test_indices),
-        ),
-        indices_dict,
-    )
-
-def leave_one_speaker_out(
-    dataset: Dataset,
-    speaker_column: str,
-    loso_test_speaker: str,
-    loso_val_speaker: str,
-) -> Tuple[DatasetDict, Dict]:
-
-    # Speaker-independent LOSO
-    # test = one speaker, val = one speaker, train = the others
-    indices_by_speaker: Dict[str, List[int]] = defaultdict(list)
-    for idx, spk in enumerate(dataset[speaker_column]):
-        indices_by_speaker[str(spk)].append(idx)
-
-    test_indices = indices_by_speaker[loso_test_speaker]
-    val_indices = indices_by_speaker[loso_val_speaker]
-    train_indices = []
-    for spk, indices in indices_by_speaker.items():
-        if spk != loso_test_speaker and spk != loso_val_speaker:
-            train_indices.extend(indices)
-
-    indices_dict = {
-        "train": sorted(train_indices),
-        "validation": sorted(val_indices),
-        "test": sorted(test_indices),
-        "split_method": "loso",
-        "loso_test_speaker": loso_test_speaker,
-        "loso_val_speaker": loso_val_speaker,
-    }
-    return (
-        DatasetDict(
-            train=dataset.select(train_indices),
-            validation=dataset.select(val_indices),
-            test=dataset.select(test_indices),
-        ),
-        indices_dict,
-    )
-
-def split_dataset(
-    dataset: Dataset,
-    method: str,
-    speaker_column: str,
-    seed: int,
-    ratios: Tuple[float, float, float],
-    loso_test_speaker: str = None,
-    loso_val_speaker: str = None,
-) -> Tuple[DatasetDict, Dict]:
-
-    # Split dataset by method: ratio (per-speaker ratios) or loso
-    if method == "ratio":
-        return split_per_speaker_ratio(
-            dataset=dataset,
-            speaker_column=speaker_column,
-            seed=seed,
-            ratios=ratios,
-        )
-    elif method == "loso":
-        return leave_one_speaker_out(
-            dataset=dataset,
-            speaker_column=speaker_column,
-            loso_test_speaker=loso_test_speaker,
-            loso_val_speaker=loso_val_speaker,
-        )
-    else:
-        raise ValueError("split_method must be 'ratio' or 'loso', got: %s" % method)

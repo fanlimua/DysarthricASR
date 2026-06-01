@@ -8,7 +8,7 @@ import argparse
 import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
-from datasets import Audio, Dataset, DatasetDict, load_dataset, load_from_disk
+from datasets import Dataset
 from transformers import (
     AutoModelForSpeechSeq2Seq,
     GenerationConfig,
@@ -17,6 +17,7 @@ from transformers import (
     Seq2SeqTrainingArguments,
     Seq2SeqTrainer,
 )
+from util.data_split import get_torgo, get_libri_test, partition_torgo_on_phrase
 from util.augment import SetEpochCallback, build_subsets
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift, RepeatPart, AddGaussianSNR, TimeMask
@@ -26,6 +27,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 torch.autograd.set_detect_anomaly(True)
 wer_metric = evaluate.load("wer")
 cer_metric = evaluate.load("cer")
+WINDOW_SIZE = 16 # This is modified by main according to input arguments
 
 @dataclass
 # Pads audio features and label sequences so each batch has the same shape
@@ -57,14 +59,20 @@ def compute_metrics(pred, tokenizer):
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
     normalizer = BasicTextNormalizer()
+    pred_str = [normalizer(p) for p in pred_str]
+    label_str = [normalizer(l) for l in label_str]
     wer = 100 * wer_metric.compute(
-        predictions=[normalizer(p) for p in pred_str], 
-        references=[normalizer(l) for l in label_str],
+        predictions=pred_str, 
+        references=label_str,
     )
     cer = 100 * cer_metric.compute(
-        predictions=[normalizer(p) for p in pred_str], 
-        references=[normalizer(l) for l in label_str],
+        predictions=pred_str, 
+        references=label_str,
     )
+    with open("pred.txt", "w") as f:
+        f.writelines([x + "\n" for x in pred_str])
+    with open('ref.txt', "w") as f:
+        f.writelines([x + "\n" for x in label_str])
     return {"wer": wer, "cer": cer }
 
 def local_channel_shuffle(x, window_size=16):
@@ -156,7 +164,7 @@ class SudoTrainer(Seq2SeqTrainer):
         num_items_in_batch: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
         try:
-            inputs["input_features"] = local_channel_shuffle(inputs["input_features"])
+            inputs["input_features"] = local_channel_shuffle(inputs["input_features"], window_size=WINDOW_SIZE)
             val = super().training_step(model, inputs, num_items_in_batch)
             # print(val)
             # assert(False)
@@ -164,6 +172,21 @@ class SudoTrainer(Seq2SeqTrainer):
         except RuntimeError:
             device = next(iter(inputs.values())).device
             return torch.tensor(0.0).to(device=device)
+
+    # def prediction_step(self,
+    #     model: nn.Module,
+    #     inputs: dict[str, torch.Tensor | Any],
+    #     prediction_loss_only: bool,
+    #     ignore_keys: list[str] | None = None):
+    #     try:
+    #         inputs["input_features"] = local_channel_shuffle(inputs["input_features"], window_size=WINDOW_SIZE)
+    #         val = super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
+    #         # print(val)
+    #         # assert(False)
+    #         return val
+    #     except RuntimeError:
+    #         device = next(iter(inputs.values())).device
+    #         return torch.tensor(0.0).to(device=device)
 
 def run_training(
     processor: WhisperProcessor, 
@@ -177,6 +200,7 @@ def run_training(
     learning_rate: float = 1e-5,
     num_train_epochs: int = 3,
     use_lora: bool = False,
+    checkpoint = None,
     **kwargs,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
@@ -209,15 +233,20 @@ def run_training(
     # model.config.forced_decoder_ids = None
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-    model_id = model_name
     if distill_whisper:
+        name = model_name 
+        if checkpoint is not None:
+            name = checkpoint
         model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            model_id, low_cpu_mem_usage=False, use_safetensors=True
+            name, low_cpu_mem_usage=False, use_safetensors=True
         )
         model.to(device).float()
     else:
+        name = model_name 
+        if checkpoint is not None:
+            name = checkpoint
         model = WhisperForConditionalGeneration.from_pretrained(
-            model_name,
+            name,
             torch_dtype=torch.float32,
             device_map="cuda" if torch.cuda.is_available() else "cpu",
         )
@@ -236,22 +265,19 @@ def run_training(
         model.generation_config.language = language
         model.generation_config.task = task
 
-    if use_lora:
-        from peft import LoraConfig, get_peft_model
-        lora_config = LoraConfig(
-            r=kwargs.get("lora_r", 16),
-            lora_alpha=kwargs.get("lora_alpha", 32),
-            target_modules=["q_proj", "k_proj"],
-            lora_dropout=kwargs.get("lora_dropout", 0.05),
-            bias="none",
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
+    # if use_lora:
+    #     from peft import LoraConfig, get_peft_model
+    #     lora_config = LoraConfig(
+    #         r=kwargs.get("lora_r", 16),
+    #         lora_alpha=kwargs.get("lora_alpha", 32),
+    #         target_modules=["q_proj", "k_proj"],
+    #         lora_dropout=kwargs.get("lora_dropout", 0.05),
+    #         bias="none",
+    #     )
+    #     model = get_peft_model(model, lora_config)
+    #     model.print_trainable_parameters()
 
     use_augmentation = kwargs.get("use_augmentation", False)
-    augment_seed = kwargs.get("seed", 42)
-    augment_snr_db_range = kwargs.get("augment_snr_db_range", (5.0, 20.0))
-    augment_rir_dir = kwargs.get("augment_rir_dir") or ""
     
     # Padding: ensures all audio features and token sequences in a batch have equal length
     data_collator = DataCollatorSpeechSeq2SeqWithPadding(
@@ -292,8 +318,8 @@ def run_training(
         push_to_hub=False,
         remove_unused_columns=False,
         label_names=["labels"],
-        eval_on_start=False,
-        # resume_from_checkpoint="results/train/new_ds4/checkpoint-27000",
+        eval_on_start=True,
+        resume_from_checkpoint=checkpoint,
     )
 
     callbacks = [SetEpochCallback()] if use_augmentation else []
@@ -308,6 +334,8 @@ def run_training(
         # tokenizer=processor.feature_extractor,
         callbacks=callbacks,
     )
+    # Data augmentation experiments, currently disabled 
+    # TODO move and clean this up 
     if False:
         healthy, dys = build_subsets(train_ds, "FC01", "F01")
         transform_fn = Compose([
@@ -356,9 +384,9 @@ def run_training(
         
         
         assert(False)
-
     # Training 
-    trainer.train(resume_from_checkpoint=False)
+    # Only set resume to true if both 1) You want optimization state 2) You are using the same output directory as checkpoint directory
+    trainer.train(resume_from_checkpoint=False) 
     trainer.save_model(output_dir)
     processor.save_pretrained(output_dir)
     print(f"Model and processor saved to {output_dir}")
@@ -368,6 +396,7 @@ def main():
     parser = argparse.ArgumentParser()
     # model settings
     parser.add_argument("--model_name", type=str, default="openai/whisper-small", choices=["openai/whisper-small", "distil-whisper/distil-large-v3"])
+    parser.add_argument("--checkpoint", type=str, default="", help="Checkpoint path")
     parser.add_argument("--language", type=str, default="en")
     parser.add_argument("--task", type=str, default="transcribe")
     # training settings
@@ -397,48 +426,31 @@ def main():
     parser.add_argument("--loso_test_speaker", type=str, default="M01", help="Speaker ID for test set.")
     parser.add_argument("--loso_val_speaker", type=str, default="M05", help="Speaker ID for validation set.")
     parser.add_argument("--short_word_max_words", type=int, default=2, help="The length of utterances.")
-    parser.add_argument("--dedup", action="store_true", help="Enable per-speaker deduplication.")
+    parser.add_argument("--phrase_split", action="store_true", help="Split by phrase instead of by speaker")
     parser.add_argument("--use_augmentation", action="store_true", help="Apply audio augmentation on train.")
     parser.add_argument("--augment_snr_db_min", type=float, default=5.0, help="Min SNR (dB) for noise augmentation.")
     parser.add_argument("--augment_snr_db_max", type=float, default=20.0, help="Max SNR (dB) for noise augmentation.")
     parser.add_argument("--augment_rir_dir", type=str, default="data/RIR/RIRS_NOISES/real_rirs_isotropic_noises", help="Directory containing real RIR files.")
     # output settings
-    parser.add_argument("--output_dir", type=str, default="results/train/new_ds5")
+    parser.add_argument("--output_dir", type=str, default="results/train/new_ds7")
     parser.add_argument("--split_indices", type=str, default="results/data_split/split_indices.json", help="Save train/val/test indices.")
+    parser.add_argument("--local_window_size", type=int, default=16, help="Size of local sliding window (power of 2)")
     args = parser.parse_args()
-
-    # load TORGO dataset 
-    # dataset_path = args.dataset_path or os.environ.get("DATASET_PATH", "/home/fan/project/dataset/Huggingface_TORGO")
-    # ratios = (args.train_ratio, args.val_ratio, args.test_ratio)
-
-    dataset = load_dataset("extraordinarylab/torgo")["test"]
-    if len(dataset.cache_files) > 32: 
-        dataset.cleanup_cache_files() # Only cleans up parquet and not downloads 
-
-    dataset = dataset.map(lambda x: {"length": x["audio"].get_all_samples().duration_seconds }, num_proc=4)
-    dataset = dataset.filter(lambda x: x["length"] <= 30, num_proc=4) # Manually confirmed the 2 samples above this are garbage
-
-    # First experiment done with language unset in DistilWhisper 
+    global WINDOW_SIZE
+    WINDOW_SIZE = args.local_window_size
+    print(f"Spectral Augmentation window size: {WINDOW_SIZE}")
+    # assert(WINDOW_SIZE == 32)
+    # model = WhisperForConditionalGeneration.from_pretrained(args.checkpoint)
+    # print(model)
+    # assert(False)
     processor = WhisperProcessor.from_pretrained(args.model_name, language=args.language, task=args.task)
     # dataset Deduplication 
-    speaker_column = "speaker"
-    text_column = "text"
-    if args.dedup:
-        assert(False)
-
-    val_speaker = args.loso_val_speaker
-    test_speaker = args.loso_test_speaker 
-    train_ds = dataset.filter(lambda x: x[speaker_column] != val_speaker and x[speaker_column] != test_speaker, num_proc=4)
-    val_ds = dataset.filter(lambda x: x[speaker_column] == val_speaker, num_proc=4)
-    tokenizer = processor.tokenizer 
-    def convert(ds, num_shards=32, iterable=False):
-        if iterable:
-            ds = ds.to_iterable_dataset(num_shards=num_shards)
-        return ds.map(
-            lambda x: {"input_features": x["audio"].get_all_samples().data.squeeze(), "labels": tokenizer(text=x[text_column]) }).remove_columns(
-                ["audio", "speech_status", "microphone", "length"])
-    
-    train = convert(train_ds, iterable=False)
+    # train, val = get_torgo(args.loso_val_speaker, args.loso_test_speaker, processor.tokenizer)
+    # val = get_libri_test(processor.tokenizer)
+    if args.phrase_split:
+        train, val = partition_torgo_on_phrase(processor.tokenizer, val_count=8)
+    else:
+        train, val = get_torgo(args.loso_val_speaker, args.loso_test_speaker, processor.tokenizer)
 
     transform_fn = Compose([
         AddGaussianSNR(min_snr_db=args.augment_snr_db_min, max_snr_db=args.augment_snr_db_max, p=0.5),
@@ -456,11 +468,14 @@ def main():
         except Exception:
             assert(False)
         return batch
-
+    
     if args.use_augmentation:
         train.set_transform(transform=transform)
-    val = convert(val_ds, num_shards=16, iterable=False)
     
+    checkpoint = None
+    if args.checkpoint != "":
+        checkpoint = args.checkpoint
+
     # training
     run_training(
         processor=processor,
@@ -489,6 +504,7 @@ def main():
         augment_snr_db_range=(args.augment_snr_db_min, args.augment_snr_db_max),
         augment_rir_dir=args.augment_rir_dir or None,
         seed=args.seed,
+        checkpoint=checkpoint,
     )
 
 
