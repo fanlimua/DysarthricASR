@@ -40,6 +40,7 @@ kenlm = ">=0.3.0, <0.4"
 textblob = ">=0.20.0, <0.21"
 pyspellchecker = ">=0.9.0, <0.10"
 audiomentations = ">=0.43.1, <0.44"
+grad-cam = ">=1.5.5, <2"
 
 [activation.env]
 HF_HOME = "/media/justin/SSD Ubuntu Stora/datasets/huggingface"

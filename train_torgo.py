@@ -9,6 +9,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 from datasets import Dataset
+from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForSpeechSeq2Seq,
     GenerationConfig,
@@ -28,6 +29,7 @@ torch.autograd.set_detect_anomaly(True)
 wer_metric = evaluate.load("wer")
 cer_metric = evaluate.load("cer")
 WINDOW_SIZE = 16 # This is modified by main according to input arguments
+numpy_rng = np.random.default_rng()
 
 @dataclass
 # Pads audio features and label sequences so each batch has the same shape
@@ -75,6 +77,56 @@ def compute_metrics(pred, tokenizer):
         f.writelines([x + "\n" for x in label_str])
     return {"wer": wer, "cer": cer }
 
+def bitwise_channel_mask(x: torch.Tensor):
+    bs = x.size(0)
+    channels = x.size(1)
+    result = numpy_rng.integers(low=1, high=255, size=(bs, channels // 8), dtype=np.uint8) # Exclude all 1s and all 0s
+    unpacked = np.unpackbits(result, axis=1)
+    unpacked = torch.from_numpy(unpacked).unsqueeze(2).to(x.device) # (bs, channel, 1)
+    with torch.no_grad():
+        return unpacked * x # Mask
+
+
+def asymmetric_channel_shuffle(x: torch.Tensor, group_sizes, dim=1, generator=None):
+    """
+    Asymmetric channel shuffle for [B, C, T] or similar tensors.
+
+    Args:
+        x: Tensor of shape [B, C, T] (or any with channel dim `dim`)
+        group_sizes: list of ints, must sum to C (e.g. [32, 8, 8, 8, ..., 32])
+        dim: channel dimension (default=1)
+        generator: optional torch.Generator for reproducibility
+
+    Returns:
+        Shuffled tensor with same shape
+    """
+    assert x.dim() >= 2, "Expected at least [B, C, T] tensor"
+
+    C = x.size(dim)
+    assert sum(group_sizes) == C, "group_sizes must sum to channel dimension"
+
+    # Split indices for channel dim
+    idx = torch.arange(C, device=x.device)
+
+    chunks = []
+    start = 0
+    for g in group_sizes:
+        end = start + g
+        chunk = idx[start:end]
+
+        # shuffle within group
+        perm = torch.randperm(g, generator=generator, device=x.device)
+        chunk = chunk[perm]
+
+        chunks.append(chunk)
+        start = end
+
+    # concatenate shuffled indices
+    shuffled_idx = torch.cat(chunks, dim=0)
+
+    # apply indexing
+    return x.index_select(dim, shuffled_idx)
+
 def local_channel_shuffle(x, window_size=16):
     """
     Randomly shuffle channels locally within fixed windows.
@@ -90,7 +142,9 @@ def local_channel_shuffle(x, window_size=16):
             Tensor with locally shuffled channels, shape [B, C, T]
     """
     B, C, T = x.shape
-    assert(C == 128) # DistilWhisper Large
+    # print("Channels + " + str(C))
+    assert(C % window_size == 0)
+    # assert(C == 128) # DistilWhisper Large
     device = x.device
 
     # Output tensor
@@ -117,6 +171,34 @@ def local_channel_shuffle(x, window_size=16):
         out[:, start:end, :] = x[batch_idx, perms, :]
 
     return out
+
+def importance_mask(x):
+    # Whisper small only for now
+    with torch.no_grad():
+        assert(x.size()[1] == 80) 
+        # Mask important
+        prob = torch.tensor([0.1931, 0.1171, 0.1171, 0.3183, 0.1931, 0.1931, 0.3183, 0.1931, 0.1931,
+        0.1931, 0.1931, 0.1931, 0.1171, 0.1171, 0.1171, 0.1171, 0.1171, 0.1171,
+        0.1171, 0.0710, 0.0710, 0.0710, 0.0710, 0.0710, 0.0710, 0.0710, 0.0710,
+        0.0710, 0.0710, 0.0710, 0.0710, 0.0710, 0.1171, 0.0710, 0.1171, 0.0710,
+        0.1171, 0.1171, 0.1171, 0.1171, 0.1171, 0.1171, 0.1171, 0.1171, 0.1171,
+        0.1171, 0.1171, 0.1171, 0.1171, 0.1931, 0.1931, 0.1171, 0.1171, 0.1171,
+        0.1171, 0.1171, 0.1171, 0.1171, 0.1171, 0.1171, 0.1171, 0.1171, 0.0710,
+        0.0710, 0.0710, 0.0710, 0.0710, 0.0710, 0.0710, 0.1171, 0.1171, 0.1171,
+        0.1171, 0.1171, 0.1171, 0.1171, 0.1171, 0.1931, 0.1171, 0.5248], device=x.device)
+        # Mask unimportant
+        # prob = torch.tensor([0.0340, 0.0924, 0.0924, 0.0125, 0.0340, 0.0340, 0.0125, 0.0340, 0.0340,
+        #     0.0340, 0.0340, 0.0340, 0.0924, 0.0924, 0.0924, 0.0924, 0.0924, 0.0924,
+        #     0.0924, 0.2513, 0.2513, 0.2513, 0.2513, 0.2513, 0.2513, 0.2513, 0.2513,
+        #     0.2513, 0.2513, 0.2513, 0.2513, 0.2513, 0.0924, 0.2513, 0.0924, 0.2513,
+        #     0.0924, 0.0924, 0.0924, 0.0924, 0.0924, 0.0924, 0.0924, 0.0924, 0.0924,
+        #     0.0924, 0.0924, 0.0924, 0.0924, 0.0340, 0.0340, 0.0924, 0.0924, 0.0924,
+        #     0.0924, 0.0924, 0.0924, 0.0924, 0.0924, 0.0924, 0.0924, 0.0924, 0.2513,
+        #     0.2513, 0.2513, 0.2513, 0.2513, 0.2513, 0.2513, 0.0924, 0.0924, 0.0924,
+        #     0.0924, 0.0924, 0.0924, 0.0924, 0.0924, 0.0340, 0.0924, 0.0046], device=x.device)
+        mask = torch.bernoulli(1.0 - prob).unsqueeze(0).unsqueeze(2).broadcast_to(x.size())
+        return x * mask
+
 
 def random_mask(x, max_mask_ratio=0.25):
     """
@@ -164,12 +246,20 @@ class SudoTrainer(Seq2SeqTrainer):
         num_items_in_batch: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
         try:
-            inputs["input_features"] = local_channel_shuffle(inputs["input_features"], window_size=WINDOW_SIZE)
+            # groups = [10, 11, 22, 22, 16, 16, 20, 11]
+            # groups = [32] + [8]*8 + [32]
+            # groups = [3] + [8] * 9 + [5]
+            # groups = [6, 10, 8, 8, 8, 8, 8, 8, 8, 8, 10, 10, 14, 14]
+            # inputs["input_features"] = importance_mask(inputs["input_features"])
+            # inputs["input_features"] = asymmetric_channel_shuffle(inputs["input_features"], groups)
+            inputs["input_features"] = bitwise_channel_mask(inputs["input_features"])
+            # inputs["input_features"] = local_channel_shuffle(inputs["input_features"], window_size=WINDOW_SIZE)
             val = super().training_step(model, inputs, num_items_in_batch)
             # print(val)
             # assert(False)
             return val
         except RuntimeError:
+            print("Runtime Error Encountered! Setting loss to 0...")
             device = next(iter(inputs.values())).device
             return torch.tensor(0.0).to(device=device)
 
@@ -249,6 +339,7 @@ def run_training(
             name,
             torch_dtype=torch.float32,
             device_map="cuda" if torch.cuda.is_available() else "cpu",
+            # attn_implementation="eager",
         )
         model.config.forced_decoder_ids = None
         if getattr(model, "generation_config", None) is not None:
@@ -318,7 +409,7 @@ def run_training(
         push_to_hub=False,
         remove_unused_columns=False,
         label_names=["labels"],
-        eval_on_start=True,
+        eval_on_start=False,
         resume_from_checkpoint=checkpoint,
     )
 
@@ -334,8 +425,22 @@ def run_training(
         # tokenizer=processor.feature_extractor,
         callbacks=callbacks,
     )
-    # Data augmentation experiments, currently disabled 
     # TODO move and clean this up 
+    # Feature importance experiments
+    if False:
+        train_loader = DataLoader(
+            val_ds,
+            batch_size=2,
+            shuffle=True,
+            collate_fn=data_collator,
+        )
+        from grad_cam import ig, channel_importance
+        # channel_importance(model, train_loader)
+        grad = ig(model, train_loader)
+        # print(grad)
+
+        assert(False)
+    # Data augmentation experiments, currently disabled 
     if False:
         healthy, dys = build_subsets(train_ds, "FC01", "F01")
         transform_fn = Compose([
@@ -432,7 +537,7 @@ def main():
     parser.add_argument("--augment_snr_db_max", type=float, default=20.0, help="Max SNR (dB) for noise augmentation.")
     parser.add_argument("--augment_rir_dir", type=str, default="data/RIR/RIRS_NOISES/real_rirs_isotropic_noises", help="Directory containing real RIR files.")
     # output settings
-    parser.add_argument("--output_dir", type=str, default="results/train/new_ds7")
+    parser.add_argument("--output_dir", type=str, default="results/train/new_ds11")
     parser.add_argument("--split_indices", type=str, default="results/data_split/split_indices.json", help="Save train/val/test indices.")
     parser.add_argument("--local_window_size", type=int, default=16, help="Size of local sliding window (power of 2)")
     args = parser.parse_args()
@@ -446,11 +551,12 @@ def main():
     processor = WhisperProcessor.from_pretrained(args.model_name, language=args.language, task=args.task)
     # dataset Deduplication 
     # train, val = get_torgo(args.loso_val_speaker, args.loso_test_speaker, processor.tokenizer)
-    # val = get_libri_test(processor.tokenizer)
+    
     if args.phrase_split:
         train, val = partition_torgo_on_phrase(processor.tokenizer, val_count=8)
     else:
         train, val = get_torgo(args.loso_val_speaker, args.loso_test_speaker, processor.tokenizer)
+    # val = get_libri_test(processor.tokenizer)
 
     transform_fn = Compose([
         AddGaussianSNR(min_snr_db=args.augment_snr_db_min, max_snr_db=args.augment_snr_db_max, p=0.5),
@@ -461,6 +567,8 @@ def main():
         TimeMask()
         # Shift(p=0.5, shift_unit="seconds"),
     ])
+
+    numpy_rng.bit_generator.state = np.random.PCG64(seed=args.seed).state # Not bulletproof because optimizer doesn't save it, but good enough
 
     def transform(batch):
         try:
