@@ -77,10 +77,8 @@ def compute_metrics(pred, tokenizer):
         f.writelines([x + "\n" for x in label_str])
     return {"wer": wer, "cer": cer }
 
-def bitwise_channel_mask(x: torch.Tensor, bits=8):
-    bs = x.size(0)
+def generate_mask(result, x: torch.Tensor, bits):
     channels = x.size(1)
-    result = numpy_rng.integers(low=1, high=(1<<bits) - 1, size=(bs, channels // bits), dtype=np.uint8) # Exclude all 1s and all 0s
     unpacked = np.unpackbits(result, axis=1, bitorder="little")
     unpacked = torch.from_numpy(unpacked).unsqueeze(2).to(x.device) # (bs, channel, 1)
     with torch.no_grad():
@@ -89,6 +87,28 @@ def bitwise_channel_mask(x: torch.Tensor, bits=8):
             t = torch.arange(0, bits) # Bits to extract
             t = t.repeat((channels // t.size(0))) + v
             unpacked = torch.index_select(unpacked, dim=1, index=t.to(x.device)).to(x.device)
+        return unpacked
+    
+def adv_bitwise_channel_mask(x: torch.Tensor, bits=8):
+    bs = x.size(0)
+    channels = x.size(1)
+    result = numpy_rng.integers(low=1, high=(1<<bits) - 1, size=(bs, channels // bits), dtype=np.uint8) # Exclude all 1s and all 0s
+    result2 = numpy_rng.integers(low=1, high=(1<<bits) - 1, size=(bs, channels // bits), dtype=np.uint8) # Exclude all 1s and all 0s
+    unpacked = generate_mask(result, x, bits)
+    unpacked2 = generate_mask(result2, x, bits)
+    u1 = unpacked.view(x.size(0), x.size(1) // bits, bits, 1).sum(dim=2).squeeze()
+    u2 = unpacked2.view(x.size(0), x.size(1) // bits, bits, 1).sum(dim=2).squeeze()
+    adv = np.where((u1 > u2).cpu().numpy(), result, result2) # With advantage
+    adv_mask = generate_mask(adv, x, bits)
+    with torch.no_grad():
+        return adv_mask * x
+
+def bitwise_channel_mask(x: torch.Tensor, bits=8):
+    bs = x.size(0)
+    channels = x.size(1)
+    result = numpy_rng.integers(low=1, high=(1<<bits) - 1, size=(bs, channels // bits), dtype=np.uint8) # Exclude all 1s and all 0s
+    unpacked = generate_mask(result, x, bits)
+    with torch.no_grad():
         return unpacked * x # Mask
 
 
@@ -257,7 +277,7 @@ class SudoTrainer(Seq2SeqTrainer):
             # groups = [6, 10, 8, 8, 8, 8, 8, 8, 8, 8, 10, 10, 14, 14]
             # inputs["input_features"] = importance_mask(inputs["input_features"])
             # inputs["input_features"] = asymmetric_channel_shuffle(inputs["input_features"], groups)
-            inputs["input_features"] = bitwise_channel_mask(inputs["input_features"], bits=4)
+            inputs["input_features"] = adv_bitwise_channel_mask(inputs["input_features"], bits=4)
             # inputs["input_features"] = local_channel_shuffle(inputs["input_features"], window_size=WINDOW_SIZE)
             val = super().training_step(model, inputs, num_items_in_batch)
             # print(val)
