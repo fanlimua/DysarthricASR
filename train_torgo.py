@@ -1,5 +1,7 @@
 import os
 import json
+from copy import copy
+import torch.nn.functional as F
 import torch
 import torch.nn as nn
 import numpy as np 
@@ -263,6 +265,160 @@ def random_mask(x, max_mask_ratio=0.25):
     masked_x = masked_x * mask.unsqueeze(-1)
     return masked_x
 
+
+class WhisperConsistencyTrainer(Seq2SeqTrainer):
+
+    def __init__(
+        self,
+        *args,
+        consistency_weight=1.0,
+        consistency_layer=-1,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        # self.mask_fn = mask_fn
+        self.consistency_weight = consistency_weight
+        self.consistency_layer = consistency_layer
+        self.ce_loss_buffer = []
+        self.consistency_loss_buffer = []
+
+    def log_scalar_dict(self, data):
+        if hasattr(self, "tb_writer") and self.tb_writer is not None:
+            # 3. Log your single value here
+            for k, v in data.items():
+                self.tb_writer.add_scalar(k, v, self.state.global_step)
+
+    def consistency_loss(self, h1, h2):
+        """
+        Cosine similarity over decoder hidden states.
+
+        h1, h2 : (B, L, D)
+        """
+        cos = F.cosine_similarity(
+            F.normalize(h1, dim=-1),
+            F.normalize(h2, dim=-1),
+            dim=-1,
+        ).mean()
+        return cos
+
+        # h1 = F.normalize(h1, dim=-1)
+        # h2 = F.normalize(h2, dim=-1)
+
+        # return (1.0 - (h1 * h2).sum(dim=-1)).mean()
+    
+    def mask_fn(self, input_features, bits=8):
+        bs = input_features.size(0)
+        channels = input_features.size(1)
+        result = numpy_rng.integers(low=1, high=(1<<bits) - 1, size=(bs, channels // bits), dtype=np.uint8)
+        mask = generate_mask(result, input_features, bits)
+        complement = torch.logical_not(mask).to(mask.device)
+        with torch.no_grad():
+            return mask * input_features, complement * input_features
+            
+    def log(self, logs, start_time=None):
+
+        if len(self.ce_loss_buffer) > 0:
+
+            logs = dict(logs)
+
+            logs["train/ce_loss"] = (
+                sum(self.ce_loss_buffer)
+                / len(self.ce_loss_buffer)
+            )
+
+            logs["train/consistency_loss"] = (
+                sum(self.consistency_loss_buffer)
+                / len(self.consistency_loss_buffer)
+            )
+
+            self.ce_loss_buffer.clear()
+            self.consistency_loss_buffer.clear()
+
+        super().log(logs, start_time)
+
+
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+        num_items_in_batch=None,
+    ):
+        
+        try:
+            # -----------------------------------------------------
+            # Construct complementary views
+            # -----------------------------------------------------
+
+            input_features = inputs["input_features"]
+
+            view1, view2 = self.mask_fn(input_features, bits=4)
+
+            inputs1 = copy(inputs)
+            inputs2 = copy(inputs)
+
+            inputs1["input_features"] = view1
+            inputs2["input_features"] = view2
+
+            # -----------------------------------------------------
+            # Forward pass
+            # -----------------------------------------------------
+
+            outputs1 = model(
+                **inputs1,
+                output_hidden_states=True,
+                output_attentions=False,
+                use_cache=False,
+            )
+
+            outputs2 = model(
+                **inputs2,
+                output_hidden_states=True,
+                output_attentions=False,
+                use_cache=False,
+            )
+
+            # -----------------------------------------------------
+            # Standard ASR objective
+            # -----------------------------------------------------
+
+            ce_loss = 0.5 * (
+                outputs1.loss +
+                outputs2.loss
+            )
+
+            # -----------------------------------------------------
+            # Consistency objective
+            # -----------------------------------------------------
+
+            h1 = outputs1.decoder_hidden_states[self.consistency_layer]
+            h2 = outputs2.decoder_hidden_states[self.consistency_layer]
+
+            consistency = self.consistency_loss(h1, h2)
+
+            loss = (
+                ce_loss
+                + self.consistency_weight * consistency
+            )
+
+            # Store metrics only
+            self.ce_loss_buffer.append(
+                ce_loss.detach().float().item()
+            )
+            self.consistency_loss_buffer.append(
+                consistency.detach().float().item()
+            )
+
+            if return_outputs:
+                return loss, outputs1
+
+            return loss
+        except RuntimeError:
+            print("Runtime Error Encountered! Setting loss to 0...")
+            device = next(iter(inputs.values())).device
+            return torch.tensor(0.0).to(device=device)
+
 class SudoTrainer(Seq2SeqTrainer):
     def training_step(
         self,
@@ -439,7 +595,7 @@ def run_training(
     )
 
     callbacks = [SetEpochCallback()] if use_augmentation else []
-    trainer = SudoTrainer(
+    trainer = WhisperConsistencyTrainer(
         args=training_args,
         model=model,
         train_dataset=train_ds,
