@@ -265,6 +265,22 @@ def random_mask(x, max_mask_ratio=0.25):
     masked_x = masked_x * mask.unsqueeze(-1)
     return masked_x
 
+def jsd_loss(logits_p, logits_q):
+    log_p = F.log_softmax(logits_p, dim=-1)
+    log_q = F.log_softmax(logits_q, dim=-1)
+
+    p = log_p.exp()
+    q = log_q.exp()
+
+    m = 0.5 * (p + q)
+    log_m = torch.log(m)
+
+    jsd = 0.5 * (
+        F.kl_div(log_m, p, reduction="batchmean") +
+        F.kl_div(log_m, q, reduction="batchmean")
+    )
+
+    return jsd
 
 class WhisperConsistencyTrainer(Seq2SeqTrainer):
 
@@ -289,18 +305,19 @@ class WhisperConsistencyTrainer(Seq2SeqTrainer):
             for k, v in data.items():
                 self.tb_writer.add_scalar(k, v, self.state.global_step)
 
-    def consistency_loss(self, h1, h2):
-        """
-        Cosine similarity over decoder hidden states.
+    def consistency_loss(self, logits1, logits2):
+        return jsd_loss(logits1, logits2)
+        # """
+        # Cosine similarity over decoder hidden states.
 
-        h1, h2 : (B, L, D)
-        """
-        cos = F.cosine_similarity(
-            F.normalize(h1, dim=-1),
-            F.normalize(h2, dim=-1),
-            dim=-1,
-        ).mean()
-        return cos
+        # h1, h2 : (B, L, D)
+        # """
+        # cos = 1.0 - F.cosine_similarity(
+        #     F.normalize(h1, dim=-1),
+        #     F.normalize(h2, dim=-1),
+        #     dim=-1,
+        # ).mean()
+        # return cos
 
         # h1 = F.normalize(h1, dim=-1)
         # h2 = F.normalize(h2, dim=-1)
@@ -392,10 +409,12 @@ class WhisperConsistencyTrainer(Seq2SeqTrainer):
             # Consistency objective
             # -----------------------------------------------------
 
-            h1 = outputs1.decoder_hidden_states[self.consistency_layer]
-            h2 = outputs2.decoder_hidden_states[self.consistency_layer]
-
-            consistency = self.consistency_loss(h1, h2)
+            # h1 = outputs1.decoder_hidden_states[self.consistency_layer]
+            # h2 = outputs2.decoder_hidden_states[self.consistency_layer]
+            logits1 = outputs1.logits
+            logits2 = outputs2.logits # Will these always have the same shape? I don't think so. 
+            assert(logits1.size() == logits2.size())
+            consistency = self.consistency_loss(logits1, logits2)
 
             loss = (
                 ce_loss
@@ -605,6 +624,8 @@ def run_training(
         processing_class=processor,
         # tokenizer=processor.feature_extractor,
         callbacks=callbacks,
+        consistency_weight=3.0,
+        consistency_layer=-2,
     )
     # TODO move and clean this up 
     # Feature importance experiments
