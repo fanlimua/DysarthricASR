@@ -299,6 +299,20 @@ class WhisperConsistencyTrainer(Seq2SeqTrainer):
         self.ce_loss_buffer = []
         self.consistency_loss_buffer = []
 
+    def training_step(
+        self,
+        model: nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        num_items_in_batch: torch.Tensor | int | None = None,
+    ) -> torch.Tensor:
+        try:
+            val = super().training_step(model, inputs, num_items_in_batch)
+            return val
+        except RuntimeError:
+            print("Runtime Error Encountered! Setting loss to 0...")
+            device = next(iter(inputs.values())).device
+            return torch.tensor(0.0).to(device=device)
+
     def log_scalar_dict(self, data):
         if hasattr(self, "tb_writer") and self.tb_writer is not None:
             # 3. Log your single value here
@@ -364,81 +378,75 @@ class WhisperConsistencyTrainer(Seq2SeqTrainer):
         return_outputs=False,
         num_items_in_batch=None,
     ):
-        
-        try:
-            # -----------------------------------------------------
-            # Construct complementary views
-            # -----------------------------------------------------
+        # -----------------------------------------------------
+        # Construct complementary views
+        # -----------------------------------------------------
 
-            input_features = inputs["input_features"]
+        input_features = inputs["input_features"]
 
-            view1, view2 = self.mask_fn(input_features, bits=4)
+        view1, view2 = self.mask_fn(input_features, bits=4)
 
-            inputs1 = copy(inputs)
-            inputs2 = copy(inputs)
+        inputs1 = copy(inputs)
+        inputs2 = copy(inputs)
 
-            inputs1["input_features"] = view1
-            inputs2["input_features"] = view2
+        inputs1["input_features"] = view1
+        inputs2["input_features"] = view2
 
-            # -----------------------------------------------------
-            # Forward pass
-            # -----------------------------------------------------
+        # -----------------------------------------------------
+        # Forward pass
+        # -----------------------------------------------------
 
-            outputs1 = model(
-                **inputs1,
-                output_hidden_states=True,
-                output_attentions=False,
-                use_cache=False,
-            )
+        outputs1 = model(
+            **inputs1,
+            output_hidden_states=True,
+            output_attentions=False,
+            use_cache=False,
+        )
 
-            outputs2 = model(
-                **inputs2,
-                output_hidden_states=True,
-                output_attentions=False,
-                use_cache=False,
-            )
+        outputs2 = model(
+            **inputs2,
+            output_hidden_states=True,
+            output_attentions=False,
+            use_cache=False,
+        )
 
-            # -----------------------------------------------------
-            # Standard ASR objective
-            # -----------------------------------------------------
+        # -----------------------------------------------------
+        # Standard ASR objective
+        # -----------------------------------------------------
 
-            ce_loss = 0.5 * (
-                outputs1.loss +
-                outputs2.loss
-            )
+        ce_loss = 0.5 * (
+            outputs1.loss +
+            outputs2.loss
+        )
 
-            # -----------------------------------------------------
-            # Consistency objective
-            # -----------------------------------------------------
+        # -----------------------------------------------------
+        # Consistency objective
+        # -----------------------------------------------------
 
-            h1 = outputs1.decoder_hidden_states[self.consistency_layer]
-            h2 = outputs2.decoder_hidden_states[self.consistency_layer]
-            # logits1 = outputs1.logits
-            # logits2 = outputs2.logits # Will these always have the same shape? I don't think so. 
-            # assert(logits1.size() == logits2.size())
-            consistency = self.consistency_loss(h1, h2)
+        h1 = outputs1.decoder_hidden_states[self.consistency_layer]
+        h2 = outputs2.decoder_hidden_states[self.consistency_layer]
+        # logits1 = outputs1.logits
+        # logits2 = outputs2.logits # Will these always have the same shape? I don't think so. 
+        # assert(logits1.size() == logits2.size())
+        consistency = self.consistency_loss(h1, h2)
 
-            loss = (
-                ce_loss
-                + self.consistency_weight * consistency
-            )
+        loss = (
+            ce_loss
+            + self.consistency_weight * consistency
+        )
 
-            # Store metrics only
-            self.ce_loss_buffer.append(
-                ce_loss.detach().float().item()
-            )
-            self.consistency_loss_buffer.append(
-                consistency.detach().float().item()
-            )
+        # Store metrics only
+        self.ce_loss_buffer.append(
+            ce_loss.detach().float().item()
+        )
+        self.consistency_loss_buffer.append(
+            consistency.detach().float().item()
+        )
 
-            if return_outputs:
-                return loss, outputs1
+        if return_outputs:
+            return loss, outputs1
 
-            return loss
-        except RuntimeError:
-            print("Runtime Error Encountered! Setting loss to 0...")
-            device = next(iter(inputs.values())).device
-            return torch.tensor(0.0).to(device=device)
+        return loss
 
 class SudoTrainer(Seq2SeqTrainer):
     def training_step(
