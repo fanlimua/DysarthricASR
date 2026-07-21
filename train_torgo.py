@@ -27,7 +27,8 @@ from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, 
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True)
+
 wer_metric = evaluate.load("wer")
 cer_metric = evaluate.load("cer")
 WINDOW_SIZE = 16 # This is modified by main according to input arguments
@@ -442,6 +443,9 @@ class WhisperConsistencyTrainer(Seq2SeqTrainer):
         self.consistency_loss_buffer.append(
             consistency.detach().float().item()
         )
+        
+        if not torch.isfinite(loss):
+            loss = torch.zeros_like(loss)
 
         if return_outputs:
             return loss, outputs1
@@ -455,23 +459,18 @@ class SudoTrainer(Seq2SeqTrainer):
         inputs: dict[str, torch.Tensor | Any],
         num_items_in_batch: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
-        try:
-            # groups = [10, 11, 22, 22, 16, 16, 20, 11]
-            # groups = [32] + [8]*8 + [32]
-            # groups = [3] + [8] * 9 + [5]
-            # groups = [6, 10, 8, 8, 8, 8, 8, 8, 8, 8, 10, 10, 14, 14]
-            # inputs["input_features"] = importance_mask(inputs["input_features"])
-            # inputs["input_features"] = asymmetric_channel_shuffle(inputs["input_features"], groups)
-            inputs["input_features"] = adv_bitwise_channel_mask(inputs["input_features"], bits=4)
-            # inputs["input_features"] = local_channel_shuffle(inputs["input_features"], window_size=WINDOW_SIZE)
-            val = super().training_step(model, inputs, num_items_in_batch)
-            # print(val)
-            # assert(False)
-            return val
-        except RuntimeError:
-            print("Runtime Error Encountered! Setting loss to 0...")
-            device = next(iter(inputs.values())).device
-            return torch.tensor(0.0).to(device=device)
+        # groups = [10, 11, 22, 22, 16, 16, 20, 11]
+        # groups = [32] + [8]*8 + [32]
+        # groups = [3] + [8] * 9 + [5]
+        # groups = [6, 10, 8, 8, 8, 8, 8, 8, 8, 8, 10, 10, 14, 14]
+        # inputs["input_features"] = importance_mask(inputs["input_features"])
+        # inputs["input_features"] = asymmetric_channel_shuffle(inputs["input_features"], groups)
+        inputs["input_features"] = adv_bitwise_channel_mask(inputs["input_features"], bits=4)
+        # inputs["input_features"] = local_channel_shuffle(inputs["input_features"], window_size=WINDOW_SIZE)
+        val = super().training_step(model, inputs, num_items_in_batch)
+        # print(val)
+        # assert(False)
+        return val
 
     # def prediction_step(self,
     #     model: nn.Module,
