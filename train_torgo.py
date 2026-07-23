@@ -28,7 +28,6 @@ from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # torch.autograd.set_detect_anomaly(True)
-
 wer_metric = evaluate.load("wer")
 cer_metric = evaluate.load("cer")
 WINDOW_SIZE = 16 # This is modified by main according to input arguments
@@ -453,6 +452,11 @@ class WhisperConsistencyTrainer(Seq2SeqTrainer):
         return loss
 
 class SudoTrainer(Seq2SeqTrainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        loss = super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+        if not torch.isfinite(loss):
+            loss = torch.zeros_like(loss)
+        return loss
     def training_step(
         self,
         model: nn.Module,
@@ -587,11 +591,12 @@ def run_training(
 
     if distill_whisper:
         for n, p in model.named_parameters():
-            if "decoder" in n:
-                p.requires_grad_(True)
-            else:
-                p.requires_grad_(False)
-        # print(n)
+            p.requires_grad_(False)
+            if "encoder" in n:
+                sp = n.split(".")[3]
+                val = int(sp) if sp.isdigit() else 0
+                if val >= 24:
+                    p.requires_grad_(True)
         # print(p.size())
 
     training_args = Seq2SeqTrainingArguments(
@@ -650,7 +655,6 @@ def run_training(
         grad = ig(model, train_loader)
         # print(grad)
 
-        assert(False)
     # Data augmentation experiments, currently disabled 
     if False:
         healthy, dys = build_subsets(train_ds, "FC01", "F01")
@@ -761,7 +765,6 @@ def main():
     # assert(False)
     processor = WhisperProcessor.from_pretrained(args.model_name, language=args.language, task=args.task)
     # dataset Deduplication 
-    # train, val = get_torgo(args.loso_val_speaker, args.loso_test_speaker, processor.tokenizer)
     
     if args.phrase_split:
         train, val = partition_torgo_on_phrase(processor.tokenizer, val_count=8)
