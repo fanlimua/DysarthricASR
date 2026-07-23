@@ -1,5 +1,7 @@
 import os
 import json
+from copy import copy
+import torch.nn.functional as F
 import torch
 import torch.nn as nn
 import numpy as np 
@@ -77,10 +79,8 @@ def compute_metrics(pred, tokenizer):
         f.writelines([x + "\n" for x in label_str])
     return {"wer": wer, "cer": cer }
 
-def bitwise_channel_mask(x: torch.Tensor, bits=8):
-    bs = x.size(0)
+def generate_mask(result, x: torch.Tensor, bits):
     channels = x.size(1)
-    result = numpy_rng.integers(low=1, high=(1<<bits) - 1, size=(bs, channels // bits), dtype=np.uint8) # Exclude all 1s and all 0s
     unpacked = np.unpackbits(result, axis=1, bitorder="little")
     unpacked = torch.from_numpy(unpacked).unsqueeze(2).to(x.device) # (bs, channel, 1)
     with torch.no_grad():
@@ -89,6 +89,28 @@ def bitwise_channel_mask(x: torch.Tensor, bits=8):
             t = torch.arange(0, bits) # Bits to extract
             t = t.repeat((channels // t.size(0))) + v
             unpacked = torch.index_select(unpacked, dim=1, index=t.to(x.device)).to(x.device)
+        return unpacked
+    
+def adv_bitwise_channel_mask(x: torch.Tensor, bits=8):
+    bs = x.size(0)
+    channels = x.size(1)
+    result = numpy_rng.integers(low=1, high=(1<<bits) - 1, size=(bs, channels // bits), dtype=np.uint8) # Exclude all 1s and all 0s
+    result2 = numpy_rng.integers(low=1, high=(1<<bits) - 1, size=(bs, channels // bits), dtype=np.uint8) # Exclude all 1s and all 0s
+    unpacked = generate_mask(result, x, bits)
+    unpacked2 = generate_mask(result2, x, bits)
+    u1 = unpacked.view(x.size(0), x.size(1) // bits, bits, 1).sum(dim=2).squeeze()
+    u2 = unpacked2.view(x.size(0), x.size(1) // bits, bits, 1).sum(dim=2).squeeze()
+    adv = np.where((u1 > u2).cpu().numpy(), result, result2) # With advantage
+    adv_mask = generate_mask(adv, x, bits)
+    with torch.no_grad():
+        return adv_mask * x
+
+def bitwise_channel_mask(x: torch.Tensor, bits=8):
+    bs = x.size(0)
+    channels = x.size(1)
+    result = numpy_rng.integers(low=1, high=(1<<bits) - 1, size=(bs, channels // bits), dtype=np.uint8) # Exclude all 1s and all 0s
+    unpacked = generate_mask(result, x, bits)
+    with torch.no_grad():
         return unpacked * x # Mask
 
 
@@ -243,6 +265,192 @@ def random_mask(x, max_mask_ratio=0.25):
     masked_x = masked_x * mask.unsqueeze(-1)
     return masked_x
 
+def jsd_loss(logits_p, logits_q):
+    log_p = F.log_softmax(logits_p, dim=-1)
+    log_q = F.log_softmax(logits_q, dim=-1)
+
+    p = log_p.exp()
+    q = log_q.exp()
+
+    m = 0.5 * (p + q)
+    log_m = torch.log(m)
+
+    jsd = 0.5 * (
+        F.kl_div(log_m, p, reduction="batchmean") +
+        F.kl_div(log_m, q, reduction="batchmean")
+    )
+
+    return jsd
+
+class WhisperConsistencyTrainer(Seq2SeqTrainer):
+
+    def __init__(
+        self,
+        *args,
+        consistency_weight=1.0,
+        consistency_layer=-1,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        # self.mask_fn = mask_fn
+        self.consistency_weight = consistency_weight
+        self.consistency_layer = consistency_layer
+        self.ce_loss_buffer = []
+        self.consistency_loss_buffer = []
+
+    def training_step(
+        self,
+        model: nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        num_items_in_batch: torch.Tensor | int | None = None,
+    ) -> torch.Tensor:
+        try:
+            val = super().training_step(model, inputs, num_items_in_batch)
+            return val
+        except RuntimeError:
+            print("Runtime Error Encountered! Setting loss to 0...")
+            device = next(iter(inputs.values())).device
+            return torch.tensor(0.0).to(device=device)
+
+    def log_scalar_dict(self, data):
+        if hasattr(self, "tb_writer") and self.tb_writer is not None:
+            # 3. Log your single value here
+            for k, v in data.items():
+                self.tb_writer.add_scalar(k, v, self.state.global_step)
+
+    def consistency_loss(self, h1, h2):
+        # return jsd_loss(logits1, logits2)
+        # """
+        # Cosine similarity over decoder hidden states.
+
+        # h1, h2 : (B, L, D)
+        # """
+        cos = 1.0 - F.cosine_similarity(
+            F.normalize(h1, dim=-1),
+            F.normalize(h2, dim=-1),
+            dim=-1,
+        )
+        log = torch.log(cos.clamp(0.01, 2.0))
+        return log.mean()
+        # return cos
+
+        # h1 = F.normalize(h1, dim=-1)
+        # h2 = F.normalize(h2, dim=-1)
+
+        # return (1.0 - (h1 * h2).sum(dim=-1)).mean()
+    
+    def mask_fn(self, input_features, bits=8):
+        bs = input_features.size(0)
+        channels = input_features.size(1)
+        result = numpy_rng.integers(low=1, high=(1<<bits) - 1, size=(bs, channels // bits), dtype=np.uint8)
+        mask = generate_mask(result, input_features, bits)
+        complement = torch.logical_not(mask).to(mask.device)
+        with torch.no_grad():
+            return mask * input_features, complement * input_features
+            
+    def log(self, logs, start_time=None):
+
+        if len(self.ce_loss_buffer) > 0:
+
+            logs = dict(logs)
+
+            logs["train/ce_loss"] = (
+                sum(self.ce_loss_buffer)
+                / len(self.ce_loss_buffer)
+            )
+
+            logs["train/consistency_loss"] = (
+                sum(self.consistency_loss_buffer)
+                / len(self.consistency_loss_buffer)
+            )
+
+            self.ce_loss_buffer.clear()
+            self.consistency_loss_buffer.clear()
+
+        super().log(logs, start_time)
+
+
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+        num_items_in_batch=None,
+    ):
+        # -----------------------------------------------------
+        # Construct complementary views
+        # -----------------------------------------------------
+
+        input_features = inputs["input_features"]
+
+        view1, view2 = self.mask_fn(input_features, bits=4)
+
+        inputs1 = copy(inputs)
+        inputs2 = copy(inputs)
+
+        inputs1["input_features"] = view1
+        inputs2["input_features"] = view2
+
+        # -----------------------------------------------------
+        # Forward pass
+        # -----------------------------------------------------
+
+        outputs1 = model(
+            **inputs1,
+            output_hidden_states=True,
+            output_attentions=False,
+            use_cache=False,
+        )
+
+        outputs2 = model(
+            **inputs2,
+            output_hidden_states=True,
+            output_attentions=False,
+            use_cache=False,
+        )
+
+        # -----------------------------------------------------
+        # Standard ASR objective
+        # -----------------------------------------------------
+
+        ce_loss = 0.5 * (
+            outputs1.loss +
+            outputs2.loss
+        )
+
+        # -----------------------------------------------------
+        # Consistency objective
+        # -----------------------------------------------------
+
+        h1 = outputs1.decoder_hidden_states[self.consistency_layer]
+        h2 = outputs2.decoder_hidden_states[self.consistency_layer]
+        # logits1 = outputs1.logits
+        # logits2 = outputs2.logits # Will these always have the same shape? I don't think so. 
+        # assert(logits1.size() == logits2.size())
+        consistency = self.consistency_loss(h1, h2)
+
+        loss = (
+            ce_loss
+            + self.consistency_weight * consistency
+        )
+
+        # Store metrics only
+        self.ce_loss_buffer.append(
+            ce_loss.detach().float().item()
+        )
+        self.consistency_loss_buffer.append(
+            consistency.detach().float().item()
+        )
+        
+        if not torch.isfinite(loss):
+            loss = torch.zeros_like(loss)
+
+        if return_outputs:
+            return loss, outputs1
+
+        return loss
+
 class SudoTrainer(Seq2SeqTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         loss = super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
@@ -255,23 +463,18 @@ class SudoTrainer(Seq2SeqTrainer):
         inputs: dict[str, torch.Tensor | Any],
         num_items_in_batch: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
-        try:
-            # groups = [10, 11, 22, 22, 16, 16, 20, 11]
-            # groups = [32] + [8]*8 + [32]
-            # groups = [3] + [8] * 9 + [5]
-            # groups = [6, 10, 8, 8, 8, 8, 8, 8, 8, 8, 10, 10, 14, 14]
-            # inputs["input_features"] = importance_mask(inputs["input_features"])
-            # inputs["input_features"] = asymmetric_channel_shuffle(inputs["input_features"], groups)
-            inputs["input_features"] = bitwise_channel_mask(inputs["input_features"], bits=4)
-            # inputs["input_features"] = local_channel_shuffle(inputs["input_features"], window_size=WINDOW_SIZE)
-            val = super().training_step(model, inputs, num_items_in_batch)
-            # print(val)
-            # assert(False)
-            return val
-        except RuntimeError:
-            print("Runtime Error Encountered! Setting loss to 0...")
-            device = next(iter(inputs.values())).device
-            return torch.tensor(0.0).to(device=device)
+        # groups = [10, 11, 22, 22, 16, 16, 20, 11]
+        # groups = [32] + [8]*8 + [32]
+        # groups = [3] + [8] * 9 + [5]
+        # groups = [6, 10, 8, 8, 8, 8, 8, 8, 8, 8, 10, 10, 14, 14]
+        # inputs["input_features"] = importance_mask(inputs["input_features"])
+        # inputs["input_features"] = asymmetric_channel_shuffle(inputs["input_features"], groups)
+        inputs["input_features"] = adv_bitwise_channel_mask(inputs["input_features"], bits=4)
+        # inputs["input_features"] = local_channel_shuffle(inputs["input_features"], window_size=WINDOW_SIZE)
+        val = super().training_step(model, inputs, num_items_in_batch)
+        # print(val)
+        # assert(False)
+        return val
 
     # def prediction_step(self,
     #     model: nn.Module,
@@ -425,7 +628,7 @@ def run_training(
     )
 
     callbacks = [SetEpochCallback()] if use_augmentation else []
-    trainer = SudoTrainer(
+    trainer = WhisperConsistencyTrainer(
         args=training_args,
         model=model,
         train_dataset=train_ds,
@@ -435,6 +638,8 @@ def run_training(
         processing_class=processor,
         # tokenizer=processor.feature_extractor,
         callbacks=callbacks,
+        consistency_weight=0.5,
+        consistency_layer=-2,
     )
     # TODO move and clean this up 
     # Feature importance experiments
