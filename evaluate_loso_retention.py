@@ -1,40 +1,4 @@
-"""Evaluate Whisper models on TORGO LOSO folds and LibriSpeech retention.
-
-The script evaluates each ``held-out-*`` model on:
-
-1. that model's held-out TORGO speaker; and/or
-2. a shared LibriSpeech set used to measure general-ASR retention.
-
-Examples
---------
-Evaluate every fold in a fine-tuning method::
-
-    pixi run python evaluate_loso_retention.py \
-      --evaluation_mode loso \
-      --method_dir results/partial_ft/partial-finetune-enc6-11-dec6-11 \
-      --eval_targets both \
-      --batch_size 128 \
-      --output_dir results/partial_ft/partial-finetune-enc6-11-dec6-11
-
-Evaluate an official pretrained Whisper model on all TORGO and LibriSpeech::
-
-    pixi run python evaluate_loso_retention.py \
-      --evaluation_mode single \
-      --model_path openai/whisper-small \
-      --eval_targets both \
-      --batch_size 128
-
-Evaluate one fine-tuned fold on its explicitly selected held-out speaker::
-
-    pixi run python evaluate_loso_retention.py \
-      --evaluation_mode single \
-      --model_path results/full_ft/full-finetune/held-out-F04/final-model \
-      --held_out_speaker F04 \
-      --eval_targets both
-"""
-
 from __future__ import annotations
-
 import argparse
 import gc
 import json
@@ -77,8 +41,6 @@ class FoldModel:
 
 @dataclass
 class WhisperRetentionCollator:
-    """Create Whisper inputs and always include a reliable attention mask."""
-
     processor: WhisperProcessor
     sample_rate: int = 16000
 
@@ -137,7 +99,6 @@ def checkpoint_type(model_dir: Path) -> str:
 
 
 def model_source_type(model_source: str) -> str:
-    """Classify a local checkpoint/adapter or a Hugging Face model identifier."""
     path = Path(model_source).expanduser()
     if path.exists():
         if not path.is_dir():
@@ -217,7 +178,8 @@ def discover_fold_models(
 
 
 def from_pretrained_with_cache_fallback(factory, source: str, **kwargs):
-    """Prefer normal Hub behavior, then use an existing cache if the Hub is down."""
+    # Try to load the model from Hugging Face Hub or local cache first, 
+    # then fall back to local files only if the first attempt fails.
     try:
         return factory.from_pretrained(source, **kwargs)
     except (OSError, RuntimeError) as online_error:
@@ -228,6 +190,8 @@ def from_pretrained_with_cache_fallback(factory, source: str, **kwargs):
 
 
 def load_fold_model(fold: FoldModel):
+    # Load a Whisper model and processor for the given fold, 
+    # handling both full checkpoints and LoRA adapters.
     model_source = str(fold.model_dir)
     processor = from_pretrained_with_cache_fallback(
         WhisperProcessor, model_source, language="en", task="transcribe"
@@ -253,6 +217,7 @@ def build_single_model(
     held_out_speaker: str | None,
     base_model: str | None,
 ) -> FoldModel:
+    # for a single model evaluation
     model_type = model_source_type(model_source)
     source_path = Path(model_source).expanduser()
     if source_path.exists():
@@ -276,6 +241,7 @@ def load_filtered_dataset(
     split: str,
     max_audio_seconds: float,
 ) -> Dataset:
+    # Load a dataset split and filter out samples exceeding the maximum audio duration.
     loaded = load_dataset(dataset_name)
     if split not in loaded:
         raise ValueError(
@@ -289,6 +255,7 @@ def select_torgo_speaker(
     speaker: str,
     speaker_column: str,
 ) -> Dataset:
+    # Select samples from the TORGO dataset corresponding to the specified speaker.
     if speaker_column not in dataset.column_names:
         raise ValueError(
             f"TORGO speaker column {speaker_column!r} is absent; "
