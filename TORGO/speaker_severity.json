@@ -1,0 +1,19 @@
+{
+  "_comment": "TORGO speaker -> clinical severity tier (paper-style table). IDs match HF abnerh/TORGO-database speaker column.",
+  "order_for_lora": ["Normal", "Mild", "Moderate", "Mod-Sev", "Severe"],
+  "FC01": "Normal",
+  "FC02": "Normal",
+  "FC03": "Normal",
+  "MC01": "Normal",
+  "MC02": "Normal",
+  "MC03": "Normal",
+  "MC04": "Normal",
+  "F04": "Mild",
+  "M03": "Mild",
+  "F03": "Moderate",
+  "M05": "Mod-Sev",
+  "F01": "Severe",
+  "M01": "Severe",
+  "M02": "Severe",
+  "M04": "Severe"
+}
