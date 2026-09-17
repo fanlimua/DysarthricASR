@@ -20,6 +20,7 @@ from transformers import (
     set_seed,
 )
 
+from models.whisper_bottleneck_adapter import adapter_summary, attach_adapters
 from train_torgo import WhisperConsistencyTrainer
 from util.loso import (
     WaveformAugmentedDataset,
@@ -95,11 +96,12 @@ def parse_args() -> argparse.Namespace:
     # Fine-tuning options
     parser.add_argument(
         "--finetune_scope",
-        choices=("full", "partial", "components", "lora"),
+        choices=("full", "partial", "components", "lora", "adapter"),
         default="full",
         help=(
             "Train all model parameters, whole selected layers, selected components "
-            "inside selected layers, or LoRA adapters on top of a frozen backbone."
+            "inside selected layers, LoRA adapters, or bottleneck Adapter modules on "
+            "top of a frozen backbone."
         ),
     )
     parser.add_argument(
@@ -151,6 +153,37 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Comma separated projections to adapt, e.g. q_proj,v_proj or "
             "q_proj,k_proj,v_proj,out_proj,fc1,fc2."
+        ),
+    )
+    parser.add_argument(
+        "--adapter_dim",
+        type=int,
+        default=64,
+        help=(
+            "Bottleneck dimension of the sequential Adapter modules "
+            "(hidden_size -> adapter_dim -> hidden_size)."
+        ),
+    )
+    parser.add_argument(
+        "--adapter_dropout",
+        type=float,
+        default=0.0,
+        help="Dropout applied to the Adapter's up-projection output.",
+    )
+    parser.add_argument(
+        "--adapter_encoder_layers",
+        default=None,
+        help=(
+            "Encoder layers that get an Adapter for --finetune_scope adapter, e.g. "
+            "8-11, 0,2,4-6, all, or none."
+        ),
+    )
+    parser.add_argument(
+        "--adapter_decoder_layers",
+        default=None,
+        help=(
+            "Decoder layers that get an Adapter for --finetune_scope adapter, e.g. "
+            "8-11, 0,2,4-6, all, or none."
         ),
     )
     parser.add_argument("--model_name", default="openai/whisper-small")
@@ -219,6 +252,8 @@ def parse_args() -> argparse.Namespace:
             args.train_encoder_layers,
             args.train_decoder_layers,
             args.train_components,
+            args.adapter_encoder_layers,
+            args.adapter_decoder_layers,
         )
     ):
         parser.error("Layer/component selection options require --mode finetune")
@@ -253,6 +288,21 @@ def parse_args() -> argparse.Namespace:
             parse_target_modules(args.lora_target_modules, "--lora_target_modules")
         except ValueError as exc:
             parser.error(str(exc))
+    if args.finetune_scope == "adapter":
+        if args.adapter_encoder_layers is None or args.adapter_decoder_layers is None:
+            parser.error(
+                "Adapter fine-tuning requires both --adapter_encoder_layers and "
+                "--adapter_decoder_layers; use 'none' to skip one side"
+            )
+        if args.adapter_dim <= 0:
+            parser.error("--adapter_dim must be positive")
+        if not 0.0 <= args.adapter_dropout < 1.0:
+            parser.error("--adapter_dropout must be in [0, 1)")
+    elif args.adapter_encoder_layers is not None or args.adapter_decoder_layers is not None:
+        parser.error(
+            "--adapter_encoder_layers/--adapter_decoder_layers require "
+            "--finetune_scope adapter"
+        )
     return args
 
 
@@ -286,10 +336,42 @@ def configure_finetuning(model, args: argparse.Namespace) -> Tuple[Any, Dict[str
     encoder_layers = model.model.encoder.layers
     decoder_layers = model.model.decoder.layers
     lora_configuration = None
+    adapter_configuration = None
     requested_components = None
     resolved_components = None
 
-    if args.finetune_scope == "lora":
+    if args.finetune_scope == "adapter":
+        try:
+            selected_encoder = parse_layer_spec(
+                args.adapter_encoder_layers,
+                len(encoder_layers),
+                "--adapter_encoder_layers",
+            )
+            selected_decoder = parse_layer_spec(
+                args.adapter_decoder_layers,
+                len(decoder_layers),
+                "--adapter_decoder_layers",
+            )
+        except ValueError as exc:
+            raise ValueError(f"Invalid adapter fine-tuning configuration: {exc}") from exc
+        if not selected_encoder and not selected_decoder:
+            raise ValueError(
+                "Adapter fine-tuning must select at least one encoder or decoder layer"
+            )
+
+        model = attach_adapters(
+            model,
+            args.adapter_dim,
+            args.adapter_dropout,
+            selected_encoder,
+            selected_decoder,
+        )
+        model.freeze_backbone()
+        if args.gradient_checkpointing:
+            # Checkpointed blocks need an input that requires grad; the backbone is frozen.
+            model.enable_input_require_grads()
+        adapter_configuration = adapter_summary(model)
+    elif args.finetune_scope == "lora":
         target_modules = parse_target_modules(
             args.lora_target_modules, "--lora_target_modules"
         )
@@ -410,6 +492,7 @@ def configure_finetuning(model, args: argparse.Namespace) -> Tuple[Any, Dict[str
         "requested_components": requested_components,
         "resolved_components": resolved_components,
         "lora": lora_configuration,
+        "adapter": adapter_configuration,
         "trainable_parameters": trainable_parameters,
         "total_parameters": total_parameters,
         "trainable_percent": 100.0 * trainable_parameters / total_parameters,
@@ -430,6 +513,13 @@ def finetune_output_dir(args: argparse.Namespace) -> Path:
         return (
             Path(args.output_dir)
             / f"lora-r{args.lora_rank}-a{args.lora_alpha}-{modules}"
+        )
+    if args.finetune_scope == "adapter":
+        encoder = layer_spec_slug(args.adapter_encoder_layers)
+        decoder = layer_spec_slug(args.adapter_decoder_layers)
+        return (
+            Path(args.output_dir)
+            / f"adapter-dim{args.adapter_dim}-enc{encoder}-dec{decoder}"
         )
     encoder = layer_spec_slug(args.train_encoder_layers)
     decoder = layer_spec_slug(args.train_decoder_layers)

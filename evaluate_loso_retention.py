@@ -19,6 +19,10 @@ from transformers import (
 )
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 
+from models.whisper_bottleneck_adapter import (
+    CONFIG_PREFIX,
+    WhisperBottleneckAdapterForConditionalGeneration,
+)
 from util.loso import audio_to_numpy, filter_by_duration, text_metrics
 
 
@@ -92,6 +96,8 @@ def checkpoint_type(model_dir: Path) -> str:
     if (model_dir / "adapter_config.json").is_file():
         return "lora_adapter"
     if (model_dir / "config.json").is_file():
+        if CONFIG_PREFIX + "dim" in read_json(model_dir / "config.json"):
+            return "bottleneck_adapter"
         return "whisper_finetuned"
     raise ValueError(
         f"{model_dir} is neither a full Whisper checkpoint nor a PEFT adapter"
@@ -201,6 +207,10 @@ def load_fold_model(fold: FoldModel):
             WhisperForConditionalGeneration, fold.base_model
         )
         model = PeftModel.from_pretrained(backbone, str(fold.model_dir), is_trainable=False)
+    elif fold.model_type == "bottleneck_adapter":
+        model = from_pretrained_with_cache_fallback(
+            WhisperBottleneckAdapterForConditionalGeneration, model_source
+        )
     else:
         model = from_pretrained_with_cache_fallback(
             WhisperForConditionalGeneration, model_source
